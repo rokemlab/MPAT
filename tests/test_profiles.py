@@ -1,8 +1,8 @@
 """Tract profiles from MPAT density maps (mpat.profiles; rokemlab/MPAT issue 6).
 
 Expected values come from outside mpat.profiles: pyAFQ's own Mahalanobis weighting (and the
-numbers pinned in pyAFQ's ``test_mahal_fix``), hand calculation, and geometry simple enough to
-know each voxel's node without a shortest-path search.
+numbers pinned in pyAFQ's ``test_mahal_fix``), hand calculation, geometry simple enough to know
+each voxel's arc length along the core, and voxels supersampled by brute force.
 """
 import csv
 import json
@@ -12,7 +12,7 @@ import numpy as np
 import numpy.testing as npt
 import pytest
 
-from mpat.profiles import _assign, _box_cdf, _mahalanobis, _spread, _weights, tract_profiles, write_profiles
+from mpat.profiles import _box_cdf, _mahalanobis, _project, _spread, _weights, tract_profiles, write_profiles
 
 # --- weighted geometry and estimator --------------------------------------------------------
 
@@ -123,7 +123,7 @@ def test_density_weighting_is_the_density_weighted_mean():
         _weights(sq, d, np.zeros(5, int), 1, "gauss")
 
 
-# --- geodesic assignment --------------------------------------------------------------------
+# --- position along the core ----------------------------------------------------------------
 
 def _u_bundle():
     """Two one-voxel-wide arms (y=1 and y=3) joined at x=20, with an empty row between them."""
@@ -135,65 +135,57 @@ def _u_bundle():
     return keep, nodes_vox
 
 
-def test_assignment_follows_the_bundle_not_straight_lines():
+def test_projection_follows_the_bundle_not_the_nearest_node():
+    """Segments, not vertices: each voxel of a U's arms lies on its own arm's segments, so its arc
+    length is its distance along that arm, also where a node of the other arm is its nearest node.
+    (Past the core's last node, x < 4 on the y = 3 arm, the voxels are nearer the other arm's first
+    segment than the last node, and go there: the limit of projecting without a graph search.)"""
     keep, nodes_vox = _u_bundle()
     aff = np.diag([2.0, 2.0, 2.0, 1.0])
-    # uniform density: MPAT's cost is zero, so its 1e-9-per-step tie-break counts steps
-    ijk, owner = _assign(keep.astype(float), keep, aff, nodes_vox @ aff[:3, :3].T)
-    assert np.all(owner >= 0)
+    core = nodes_vox @ aff[:3, :3].T
+    ijk = np.argwhere(keep)
+    s, _ = _project(ijk @ aff[:3, :3].T, core)
+    s_node = np.r_[0, np.cumsum(np.linalg.norm(np.diff(core, axis=0), axis=1))]
     arm_of_node = np.array([1, 1, 1, -1, 3, 3, 3])
-    checked = wrong_by_euclid = 0
-    for (i, j, _), o in zip(ijk, owner):
-        if i > 16:
-            continue                                      # near the bend node: no straight-arm oracle
-        # in a straight one-voxel-wide arm the geodesic is |dx|: nearest node in the same arm
-        same = np.flatnonzero(arm_of_node == j)
-        dx = np.abs(nodes_vox[same, 0] - i)
-        if np.sort(dx)[1] - dx.min() < 1:
-            continue                                      # (near) tie
-        assert o == same[np.argmin(dx)], (i, j)
+    checked = nearest_node_wrong = 0
+    for (i, j, _), s_i in zip(ijk, s):
+        if i > 15 or (j == 3 and i < 4):
+            continue                                      # the bend; past the core's last node
+        along_arm = 2.0 * (i - 1) if j == 1 else s_node[4] + 2.0 * (18 - i)
+        npt.assert_allclose(s_i, along_arm, atol=1e-9, err_msg=str((i, j)))
         checked += 1
-        euclid = np.argmin(np.linalg.norm(nodes_vox - [i, j, 1], axis=1))
-        wrong_by_euclid += arm_of_node[euclid] != j
-    assert checked > 20 and wrong_by_euclid > 0           # the case discriminates
+        nearest = np.argmin(np.linalg.norm(nodes_vox - [i, j, 1], axis=1))
+        nearest_node_wrong += arm_of_node[nearest] != j
+    assert checked == 27 and nearest_node_wrong > 0      # the case discriminates
 
 
-def test_assignment_uses_mpats_density_cost():
-    """MPAT's cross-section metric (core.py step 3): -log(density / peak) per mm.  A line of
-    voxels x = 0..10, density 0.01 for x <= 3 and 1 beyond, nodes at x = 2 and x = 8.  By hand,
-    with c = -ln(0.01) = 4.61: voxel 3 costs c x 1 mm = 4.61 from node 0, but only
-    0 (x = 8..4) + (0 + c) / 2 = 2.30 from node 1, so node 1 owns it -- physical length says node 0."""
-    dn = np.where(np.arange(11) <= 3, 0.01, 1.0)[:, None, None]
-    keep = np.ones(dn.shape, bool)
-    ijk, owner = _assign(dn, keep, np.eye(4), np.array([[2.0, 0, 0], [8.0, 0, 0]]))
-    npt.assert_array_equal(owner[np.argsort(ijk[:, 0])], [0, 0, 0] + [1] * 8)
+def test_projection_is_continuous_and_runs_past_the_ends():
+    """On a bent core: arc length is continuous along a segment (not snapped to nodes), points
+    beyond the end nodes get s < 0 or s > length, and a point outside the bend maps to its node."""
+    core = np.array([[0, 0, 0], [10, 0, 0], [10, 10, 0]], float)
+    x = np.array([[3.3, 1, 0], [-4, 0.5, 0], [10, 17, 0], [12, -2, 0], [10.2, 6.5, 0.2]])
+    s, u = _project(x, core)
+    npt.assert_allclose(s, [3.3, -4, 27, 10, 16.5], atol=1e-12)
+    npt.assert_allclose(u[[0, 1, 2, 4]], [[1, 0, 0], [1, 0, 0], [0, 1, 0], [0, 1, 0]], atol=1e-12)
 
 
-def test_assignment_steps_match_mpat():
-    """Step lengths are bundle_core's: |offset| x vox_mm, vox_mm = |det A|^(1/3) (one mean voxel
-    size), including the step from a node to its cell's corners.  On a (1, 1, 4) mm grid vox_mm =
-    4^(1/3) = 1.587, and with cost c = ln 2 off the peak, by hand: voxel (2,0,0) is one diagonal
-    step from node B at voxel (3,0,1), sqrt(2) x 1.587 x c = 1.56, while from node A at voxel
-    (0,0,0) the cheapest route (via the zero-cost peak at (0,0,1)) is
-    sqrt(2) x 1.587 x c / 2 + 1.587 x c = 1.88.  So B owns it (physical mm would say A: 2 vs 4.1)."""
-    dn = np.full((4, 1, 2), 0.5)
-    dn[0, 0, 1] = 1.0                                     # the peak: elsewhere cost is ln 2
-    aff = np.diag([1.0, 1.0, 4.0, 1.0])
-    ijk, owner = _assign(dn, dn > 0, aff, np.array([[0, 0, 0], [3, 0, 4.0]]))
-    assert owner[np.flatnonzero((ijk == [2, 0, 0]).all(1))[0]] == 1
+def test_coincident_and_collapsed_nodes():
+    """Nodes keep their numbers: a zero-length segment is skipped, and two coincident nodes split
+    their stretch of the core at the point they share.  A core collapsed to a single point gives
+    every voxel wholly to node 0."""
+    core = np.array([[0, 0, 0], [5, 0, 0], [5, 0, 0], [10, 0, 0]], float)
+    s, _ = _project(np.array([[7.0, 1, 0], [12, 0, 0], [-1, 0, 0]]), core)
+    npt.assert_allclose(s, [7, 12, -1], atol=1e-12)
+    vox, node, share = _spread(np.array([[4.0, 0, 0], [6, 0, 0]]), core, np.eye(4))
+    npt.assert_array_equal(vox, [0, 1])
+    npt.assert_array_equal(node, [1, 2])
+    npt.assert_allclose(share, 1, atol=1e-12)
 
-
-def test_duplicate_and_detached_nodes_keep_their_numbers():
-    keep, nodes_vox = _u_bundle()
-    nodes_vox = np.vstack([nodes_vox[:2], nodes_vox[1:2], nodes_vox[2:], [[10, 4.8, 2.5]]])
-    aff = np.eye(4)
-    _, owner = _assign(keep.astype(float), keep, aff, nodes_vox)
-    counts = np.bincount(owner[owner >= 0], minlength=len(nodes_vox))
-    # nodes 1 and 2 coincide: one owns their voxels, the other is empty; the last node has no
-    # support voxel at any corner of its cell (detached) and is empty too
-    assert sorted(counts[1:3] > 0) == [False, True]
-    assert counts[-1] == 0
-    assert np.all(counts[[0, 3, 4, 5, 6, 7]] > 0)
+    assert _project(np.zeros((2, 3)), np.ones((4, 3))) is None
+    d, aff, core = _straight_bundle()
+    prof, info = tract_profiles(d, aff, np.repeat(core[4:5], 5, 0), {"x": nib.Nifti1Image(d, aff)})
+    assert np.isfinite(prof["x"][0]) and np.all(np.isnan(prof["x"][1:]))
+    assert info["empty_nodes"] == [1, 2, 3, 4]
 
 
 # --- spreading each voxel along the core ----------------------------------------------------
@@ -215,24 +207,57 @@ def test_spread_shares_by_hand():
     [4, 6] mm, so it is 1/4 node 4, 1/2 node 5 and 1/4 node 6."""
     aff = np.diag([2.0, 2.0, 2.0, 1.0])
     core = np.stack([np.arange(11.0), np.zeros(11), np.zeros(11)], 1)
-    vox, node, share = _spread(np.array([[5.0, 0, 0]]), np.array([5]), core, aff)
+    vox, node, share = _spread(np.array([[5.0, 0, 0]]), core, aff)
     npt.assert_array_equal(vox, 0)
     npt.assert_array_equal(node, [4, 5, 6])
     npt.assert_allclose(share, [0.25, 0.5, 0.25], atol=1e-12)
 
 
+def _supersampled_shares(x, affine, core, n=60):
+    """Brute force on a straight core: split each voxel's cube into n^3 sub-cubes, place each
+    sub-centre at its arc length along the core's line, and count them into the nodes' bins."""
+    c = (np.arange(n) + 0.5) / n - 0.5
+    sub = np.stack(np.meshgrid(c, c, c, indexing="ij"), -1).reshape(-1, 3) @ affine[:3, :3].T
+    u = (core[-1] - core[0]) / np.linalg.norm(core[-1] - core[0])
+    s_node = (core - core[0]) @ u
+    edges = np.r_[-np.inf, (s_node[:-1] + s_node[1:]) / 2, np.inf]
+    out = np.zeros((len(x), len(core)))
+    for i, xi in enumerate(x):
+        out[i] = np.bincount(np.searchsorted(edges, (xi + sub - core[0]) @ u) - 1, minlength=len(core))
+    return out / len(sub)
+
+
+def test_spread_is_the_limit_of_supersampling():
+    """On a straight core a voxel's shares are what infinitely fine supersampling of its cube
+    gives -- here with an oblique core, unevenly spaced nodes closer than a voxel, voxels past both
+    ends, and a sheared, anisotropic grid.  Each voxel's shares sum to one."""
+    affine = np.array([[1.8, 0.3, 0, 5], [0, 2.2, -0.4, -3], [0.2, 0, 2.5, 1], [0, 0, 0, 1]])
+    rng = np.random.default_rng(0)
+    u = np.array([2.0, 1.0, -0.5]) / np.linalg.norm([2.0, 1.0, -0.5])
+    t = np.cumsum(np.r_[0, rng.uniform(0.4, 1.6, 30)])
+    core = np.array([1, -2, 3.0]) + t[:, None] * u
+    x = core[0] + rng.uniform(-4, t[-1] + 4, 16)[:, None] * u + rng.normal(0, 3, (16, 3))
+    vox, node, share = _spread(x, core, affine)
+    W = np.zeros((len(x), len(core)))
+    np.add.at(W, (vox, node), share)
+    npt.assert_allclose(W.sum(1), 1, atol=1e-12)
+    npt.assert_allclose(W, _supersampled_shares(x, affine, core), atol=1e-3)
+
+
 def test_spread_fills_nodes_closer_than_a_voxel():
-    """Nodes every half voxel along a straight tube: hard assignment leaves nodes without voxels,
-    spreading gives every node a share, and each voxel's shares sum to one."""
+    """Nodes every half voxel along a straight tube: giving each voxel to its nearest node leaves
+    nodes without voxels, spreading gives every node a share, and each voxel's shares sum to one."""
+    from mpat.core import _support
+
     d, aff, _ = _straight_bundle()
     n = 40
     core = nib.affines.apply_affine(aff, np.stack([np.linspace(2, 21, n), np.full(n, 3.0), np.full(n, 3.0)], 1))
-    dn = d / d.max()
-    ijk, owner = _assign(dn, dn > 1e-6, aff, core)
-    vox, node, share = _spread(nib.affines.apply_affine(aff, ijk), owner, core, aff)
-    assert len(np.setdiff1d(np.arange(n), owner)) > 0
+    x = nib.affines.apply_affine(aff, np.argwhere(_support(d / d.max(), 1e-6)))
+    nearest = np.linalg.norm(x[:, None] - core, axis=-1).argmin(1)
+    assert len(np.setdiff1d(np.arange(n), nearest)) > 0
+    vox, node, share = _spread(x, core, aff)
     npt.assert_array_equal(np.unique(node), np.arange(n))
-    npt.assert_allclose(np.bincount(vox, share, len(owner))[owner >= 0], 1, atol=1e-9)
+    npt.assert_allclose(np.bincount(vox, share, len(x)), 1, atol=1e-9)
 
 
 # --- scalars on another grid ----------------------------------------------------------------

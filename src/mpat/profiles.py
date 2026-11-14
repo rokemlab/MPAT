@@ -4,18 +4,25 @@ For one bundle and its core (``mpat.core``, n nodes in world mm):
 
 1. Support.  The voxels ``bundle_core`` builds its graph on: density above ``floor`` x peak, in
    the connected component that holds the peak.
-2. Assignment.  Each support voxel gets the core node nearest to it along the bundle, in MPAT's
-   cross-section metric (``bundle_core`` step 3: -log(density / peak) per mm on the support's
-   26-neighbour graph, same step lengths and tie-break), by one multi-source Dijkstra.  A node
-   enters the graph through the support voxels at the corners of the voxel cell it lies in.
-   Nodes are never moved or renumbered; one with no support corner, or one that coincides with
-   another, gets no voxels here.
-3. Spreading.  A voxel is a cube that spans a stretch of the core, so it is shared between the
-   nodes along that stretch.  Its centre is projected onto the core segment next to its node from
-   step 2 (arc length s, direction u); projected onto u the cube is a sum of three uniform
-   lengths |a_k . u| (a_k the affine's columns), and its share of node n is the fraction of that
-   between the midpoints to n's neighbours.  Shares sum to one.  Without this, nodes closer
-   together than a voxel get no voxels (about half the nodes of a 100 mm bundle on 2 mm voxels).
+2. Position along the core.  Each support voxel's centre is projected onto the nearest point of
+   the core polyline -- onto its segments, not its vertices -- for a continuous arc length s and
+   that segment's direction u.  Past either end s runs on along the end segment (s < 0, or beyond
+   the core's length) instead of stopping at the end node.  There is no graph search: a voxel goes
+   where it lies along the tract, and where a bundle bends back on itself (a U) a voxel still lies
+   on its own arm's segments even when a node of the other arm is nearer to it.  The exception is
+   a tight hairpin: a voxel past one end of the core that is nearer another part of the core than
+   that end goes to the nearer part.
+3. Spreading.  A voxel is a cube, not a point, so it covers a stretch of the core and is shared
+   between the nodes along that stretch.  Projected onto u, a uniform cube is the sum of three
+   uniform lengths |a_k . u| (a_k the affine's columns; D (|u_x| + |u_y| + |u_z|) in all for
+   isotropic voxels of side D), and its share of node n is the fraction of that projected mass
+   in n's bin, between the midpoints to n's neighbours (the end nodes' bins are open), from the
+   exact piecewise-polynomial CDF (``_box_cdf``).  That is the limit of supersampling the voxel
+   infinitely finely and binning the subpoints by arc length, exact while the core is straight
+   across the voxel; a voxel touches only the two or three bins it spans, and its shares sum to
+   one.  Without this, nodes closer together than a voxel get no voxels (about half the nodes of
+   a 100 mm bundle on 2 mm voxels).  Nodes are never moved or renumbered; two that coincide split
+   their stretch of the core at the point they share.
 4. Weights.  d_i = density / peak x the voxel's share of the node.  ``weighting``:
    "mahalanobis"  w_i = d_i / D_i, D_i the Mahalanobis distance of the voxel centre from the
                   node's d-weighted mean in its d-weighted covariance (pinvh, so thin cross-sections
@@ -39,33 +46,33 @@ import nibabel as nib
 import numpy as np
 
 from .afq import _on_grid
-from .core import _graph, _support, bundle_files
+from .core import _support, bundle_files
 
-CELL = np.array([(i, j, k) for i in (0, 1) for j in (0, 1) for k in (0, 1)])
+BLOCK = 1 << 20     # voxel x segment pairs per block of the nearest-segment search (memory bound)
 
 
-def _assign(dn, keep, affine, xyz):
-    """(ijk (m, 3) support voxels, owner (m,) node index or -1) -- see step 2."""
-    import scipy.sparse as sps
-    from scipy.sparse.csgraph import dijkstra
-
-    vox_mm = float(np.abs(np.linalg.det(affine[:3, :3])) ** (1 / 3))  # as bundle_core
-    cost = np.where(keep, -np.log(np.where(keep, dn, 1.0)), 0.0)   # as bundle_core's cost1
-    G, idx, lin = _graph(cost, keep, vox_mm)
-    m, n = len(idx), len(xyz)
-    ijk = nib.affines.apply_affine(np.linalg.inv(affine), xyz)
-    corner = np.floor(ijk).astype(np.int64)[:, None] + CELL            # (n, 8, 3)
-    inside = np.all((corner >= 0) & (corner < keep.shape), -1)
-    vox = np.full(inside.shape, -1, np.int64)
-    vox[inside] = lin[tuple(corner[inside].T)]
-    on = vox >= 0
-    mm = np.linalg.norm(corner - ijk[:, None], axis=-1) * vox_mm
-    c = np.zeros(vox.shape)
-    c[on] = cost[tuple(idx[vox[on]].T)]
-    E = sps.csr_matrix((mm[on] * c[on] + 1e-9, (m + np.nonzero(on)[0], vox[on])), shape=(m + n, m + n))
-    G = sps.block_diag((G, sps.csr_matrix((n, n)))).tocsr() + E
-    dist, _, src = dijkstra(G, indices=m + np.arange(n), min_only=True, return_predecessors=True)
-    return idx, np.where(np.isfinite(dist[:m]), src[:m] - m, -1)
+def _project(x, core):
+    """(s, u) of each point x (m, 3) -- see step 2: arc length along the core of its nearest point
+    on the core polyline, and the unit direction of that segment; or None if the core has no
+    segment of length > 0."""
+    seg = np.diff(core, axis=0)
+    L = np.linalg.norm(seg, axis=1)
+    js = np.flatnonzero(L > 0)                               # coincident nodes make no segment
+    if not len(js):
+        return None
+    s_node = np.r_[0, np.cumsum(L)][js]
+    L, T, start = L[js], seg[js] / L[js, None], core[js]
+    s, j = np.empty(len(x)), np.empty(len(x), int)
+    step = max(1, BLOCK // len(js))
+    for a in range(0, len(x), step):
+        rel = x[a:a + step, None] - start                    # (m, J, 3)
+        t = np.einsum("mjk,jk->mj", rel, T)                  # along each segment's line
+        near = np.square(rel - np.clip(t, 0, L)[..., None] * T).sum(-1).argmin(1)
+        t = t[np.arange(len(near)), near]
+        # the end segments run on past the core's ends; every other point stays on its segment
+        t = np.clip(t, np.where(near == 0, -np.inf, 0), np.where(near == len(js) - 1, np.inf, L[near]))
+        s[a:a + step], j[a:a + step] = s_node[near] + t, near
+    return s, T[j]
 
 
 def _box_cdf(z, w):
@@ -86,26 +93,17 @@ def _box_cdf(z, w):
     return out
 
 
-def _spread(x, owner, core, affine):
-    """(voxel index, node, share) of every voxel's shares -- see step 3."""
-    seg = np.diff(core, axis=0)
-    L = np.linalg.norm(seg, axis=1)
-    s_node = np.r_[0, np.cumsum(L)]
+def _spread(x, core, affine):
+    """(voxel index, node, share) of every voxel's shares of the nodes -- see step 3.  A core
+    collapsed to a single point gives every voxel wholly to node 0."""
+    v = np.arange(len(x))
+    su = _project(x, core)
+    if su is None:
+        return v, np.zeros(len(x), int), np.ones(len(x))
+    s, u = su
+    s_node = np.r_[0, np.cumsum(np.linalg.norm(np.diff(core, axis=0), axis=1))]
     edges = np.r_[-np.inf, (s_node[:-1] + s_node[1:]) / 2, np.inf]      # node n spans edges n..n+1
-    v = np.flatnonzero(owner >= 0)
-    best = np.full(len(v), np.inf)
-    s = np.empty(len(v))
-    j_of = np.zeros(len(v), int)
-    for j in (owner[v] - 1, owner[v]):                     # the two segments at the voxel's node
-        ok = (j >= 0) & (j < len(seg)) & (L[np.clip(j, 0, len(seg) - 1)] > 0)
-        jj = np.clip(j, 0, len(seg) - 1)
-        t = np.einsum("ij,ij->i", x[v] - core[jj], seg[jj]) / np.where(ok, L[jj] ** 2, 1)
-        t = np.clip(t, np.where(jj == 0, -np.inf, 0), np.where(jj == len(seg) - 1, np.inf, 1))
-        dist = np.where(ok, np.linalg.norm(x[v] - core[jj] - t[:, None] * seg[jj], axis=1), np.inf)
-        better = dist < best
-        best[better], s[better], j_of[better] = dist[better], (s_node[jj] + t * L[jj])[better], jj[better]
-    whole = ~np.isfinite(best)                               # no segment of length > 0 at its node
-    w = np.where(whole[:, None], 1.0, np.abs((seg[j_of] / np.where(whole, 1, L[j_of])[:, None]) @ affine[:3, :3]))
+    w = np.abs(u @ affine[:3, :3])                           # the cube's three edges along u
     half = w.sum(1) / 2
     lo = np.searchsorted(edges, s - half) - 1
     hi = np.searchsorted(edges, s + half) - 1
@@ -114,8 +112,6 @@ def _spread(x, owner, core, affine):
     nodes[past] = 0
     F = _box_cdf(edges[nodes + 1] - s[:, None], w) - _box_cdf(edges[nodes] - s[:, None], w)
     F[past] = 0
-    F[whole] = 0
-    F[whole, 0], nodes[whole, 0] = 1.0, owner[v[whole]]
     keep = F > 1e-12
     return np.broadcast_to(v[:, None], F.shape)[keep], nodes[keep], F[keep]
 
@@ -167,11 +163,12 @@ def tract_profiles(density, affine, core, scalars, n_nodes=100, floor=1e-6,
     if d.max() <= 0 or core is None:
         status = "empty" if d.max() <= 0 else "no core"
         return {k: np.full(n_nodes, np.nan) for k in scalars}, dict(status=status)
+    core = np.asarray(core, float)
     n = len(core)
     dn = d / d.max()
-    ijk, owner = _assign(dn, _support(dn, floor), affine, core)
+    ijk = np.argwhere(_support(dn, floor))
     x = nib.affines.apply_affine(affine, ijk)
-    vox, node, share = _spread(x, owner, core, affine)
+    vox, node, share = _spread(x, core, affine)
     w = _weights(x[vox], dn[tuple(ijk.T)][vox] * share, node, n, weighting)
     out = {}
     ref = nib.Nifti1Image(d, affine)
@@ -182,7 +179,7 @@ def tract_profiles(density, affine, core, scalars, n_nodes=100, floor=1e-6,
         den = np.bincount(node[ok], w[ok], n)
         out[name] = np.divide(num, den, out=np.full(n, np.nan), where=den > 0)
     count = np.bincount(node, minlength=n)
-    return out, dict(status="ok", n_support=len(owner), empty_nodes=np.flatnonzero(count == 0).tolist())
+    return out, dict(status="ok", n_support=len(ijk), empty_nodes=np.flatnonzero(count == 0).tolist())
 
 
 def write_profiles(folder, scalars, weighting="mahalanobis"):
