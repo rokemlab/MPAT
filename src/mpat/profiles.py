@@ -31,14 +31,14 @@ For one bundle and its core (``mpat.core``, n nodes in world mm):
    profile (pyAFQ's: 2.0x without streamline-length variation); the linear kernel's 1.5x, with
    the lowest RMSE of the three.
 4. Weights.  d_i = density / peak x the voxel's share of the node.  ``weighting``:
-   "mahalanobis"  w_i = d_i / D_i, D_i the Mahalanobis distance of the voxel centre from the
-                  node's d-weighted mean in its d-weighted covariance (pinvh, so thin cross-sections
-                  are kept): pyAFQ's ``gaussian_weights`` with every sum weighted by d.  As there, a
-                  voxel exactly at the mean gets zero weight; a node whose weights are all zero
-                  (one voxel) is weighted by d alone.
-   "density"      w_i = d_i: the expected value over MPAT's walkers, no cross-section geometry.
-   Which should be the default is open; on Stanford HARDI and one HBN subject, density-only
-   correlated better with pyAFQ's profiles and was smoother than d / D.
+   "density"   w_i = d_i (the default): the expected value over MPAT's walkers -- the mean that
+               all of MPAT's streamlines see in the node's stretch -- with no cross-section geometry.
+   "gaussian"  w_i = d_i exp(-D_i^2 / 2), D_i the Mahalanobis distance of the voxel centre from the
+               node's d-weighted mean in its d-weighted covariance (pinvh, so thin cross-sections
+               are kept).  Favours the bundle's core as pyAFQ's ``gaussian_weights`` does, but where
+               pyAFQ weights by 1 / D -- infinite at the centre, which a few dozen voxels per
+               cross-section cannot average out (MPAT's profiles were 3x rougher with it) -- this is
+               finite everywhere: a one-voxel node, or one at the centre, just gets d_i.
 5. Profile.  P_n = sum w_i s_i / sum w_i over node n's voxels with a finite scalar s_i; NaN if
    there are none (info lists nodes with no voxels in ``empty_nodes``).  Scalars are put on the
    density grid with ``afq._on_grid`` (linear); voxels outside a scalar's grid read 0 there.
@@ -147,35 +147,29 @@ def _mahalanobis(x, d):
     return np.sqrt(np.clip(D2, 0, None))
 
 
-def _weights(x, d, owner, n, weighting="mahalanobis"):
+def _weights(x, d, owner, n, weighting="density"):
     """Unnormalised profile weight of every voxel (step 4)."""
     if weighting == "density":
         return d
-    if weighting != "mahalanobis":
-        raise ValueError(f"weighting must be 'mahalanobis' or 'density', not {weighting!r}")
+    if weighting != "gaussian":
+        raise ValueError(f"weighting must be 'density' or 'gaussian', not {weighting!r}")
     w = np.zeros(len(x))
     for k in range(n):
         i = np.flatnonzero(owner == k)
-        if not len(i):
-            continue
-        with np.errstate(divide="ignore", invalid="ignore"):
-            wk = d[i] / _mahalanobis(x[i], d[i])
-        # inverse distances that are not finite get no weight, as in pyAFQ:
-        # https://github.com/tractometry/pyAFQ/blob/65a43a88ff1cf1e681a04a47010c9bb8dbb07ed8/AFQ/_fixes.py#L355-L357
-        wk[~np.isfinite(wk)] = 0
-        w[i] = wk if wk.sum() > 0 else d[i]
+        if len(i):
+            w[i] = d[i] * np.exp(-0.5 * _mahalanobis(x[i], d[i]) ** 2)
     return w
 
 
 def tract_profiles(density, affine, core, scalars, n_nodes=100, floor=1e-6,
-                   weighting="mahalanobis", kernel="linear"):
+                   weighting="density", kernel="linear"):
     """Profiles of one bundle: ({scalar: (n,) values}, info).
 
     density   3-D bundle density map (NaN / negative read as 0, as bundle_core does)
     core      (n, 3) core nodes in world mm (``Core.xyz``), or None when there is none
     scalars   {name: nibabel image}
     n_nodes   the node count when there is no core; otherwise the core's own count is kept
-    weighting "mahalanobis" or "density" (step 4)
+    weighting "density" (default) or "gaussian" (step 4)
     kernel    "linear" (default) or "box": how each voxel is spread along the core (step 3)
     """
     d = np.clip(np.nan_to_num(np.asarray(density, float)), 0, None)   # as bundle_core
@@ -201,7 +195,7 @@ def tract_profiles(density, affine, core, scalars, n_nodes=100, floor=1e-6,
     return out, dict(status="ok", n_support=len(ijk), empty_nodes=np.flatnonzero(count == 0).tolist())
 
 
-def write_profiles(folder, scalars, weighting="mahalanobis", kernel="linear"):
+def write_profiles(folder, scalars, weighting="density", kernel="linear"):
     """Profiles of every MPAT bundle under ``folder`` from its saved core (``write_cores``), as
     pyAFQ-style ``<stem>_desc-profiles_tractography.csv`` (tractID, nodeID, one column per scalar;
     missing values empty) and a ``.json`` with each bundle's status.

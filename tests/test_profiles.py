@@ -56,71 +56,61 @@ XSEC_S = np.array([0.30, 0.55, 0.41, 0.62, 0.20, 0.48, 0.71])
 
 
 def test_density_weights_equal_replicated_points():
-    """Density d_i is exactly a voxel repeated d_i times: weighted mean, population covariance,
-    distances and the inverse-distance profile all match pyAFQ on the replicated points."""
-    D_ref, w_ref, which = _pyafq_replicated(XSEC, XSEC_D)
+    """Density d_i is exactly a voxel repeated d_i times: the weighted mean and population
+    covariance give pyAFQ's Mahalanobis distances on the replicated points."""
+    D_ref, _, _ = _pyafq_replicated(XSEC, XSEC_D)
     npt.assert_allclose(_mahalanobis(XSEC, XSEC_D.astype(float)), D_ref, rtol=1e-10)
-
-    owner = np.zeros(len(XSEC), int)
-    w = _weights(XSEC, XSEC_D.astype(float), owner, 1)
-    profile = (w * XSEC_S).sum() / w.sum()
-    expected = (w_ref * XSEC_S[which]).sum()              # pyAFQ weights already sum to one
-    npt.assert_allclose(profile, expected, rtol=1e-10)
-
-    # ...which neither unweighted geometry nor density-only weighting (QSIRecon's bundle mean) gives
-    D_unweighted = _mahalanobis(XSEC, np.ones(len(XSEC)))
-    unweighted = (XSEC_D / D_unweighted * XSEC_S).sum() / (XSEC_D / D_unweighted).sum()
-    density_only = (XSEC_D * XSEC_S).sum() / XSEC_D.sum()
-    assert abs(unweighted - expected) > 1e-3
-    assert abs(density_only - expected) > 1e-3
+    # ...which unweighted geometry does not give
+    assert np.abs(_mahalanobis(XSEC, np.ones(len(XSEC))) - D_ref).max() > 1e-3
 
 
 @pytest.mark.parametrize("flat", [(2,), (1, 2)], ids=["planar", "linear"])
 def test_thin_cross_sections_use_the_pseudoinverse(flat):
-    """Rank-2 and rank-1 cross-sections are valid: no fallback, and pinvh agrees with pyAFQ."""
+    """Rank-2 and rank-1 cross-sections are valid: pinvh agrees with pyAFQ, and every Gaussian
+    weight is finite and positive."""
     x = XSEC.copy()
     x[:, list(flat)] = 7.0
     x[:, 0] = XSEC[:, 0] + 0.1 * np.arange(len(x))      # keep the points distinct
     D_ref, _, _ = _pyafq_replicated(x, XSEC_D)
     npt.assert_allclose(_mahalanobis(x, XSEC_D.astype(float)), D_ref, rtol=1e-8)
-    w = _weights(x, XSEC_D.astype(float), np.zeros(len(x), int), 1)
+    w = _weights(x, XSEC_D.astype(float), np.zeros(len(x), int), 1, "gaussian")
     assert np.all(np.isfinite(w) & (w > 0))
 
 
-def test_collapsed_node_falls_back_locally():
-    """A one-voxel node is weighted by density alone; the other nodes are untouched."""
+def test_gaussian_weights_by_hand():
+    """w_i = d_i exp(-D_i^2 / 2): a symmetric square of unit densities and its centre.  The
+    d-weighted covariance is diag(2/3, 2/3, 0) (pinvh: the flat axis drops out), so a corner has
+    D^2 = 2 / (2/3) = 3 and weight exp(-1.5); the centre, D = 0, gets its full density -- the
+    voxel that pyAFQ's 1 / D would make infinite."""
+    sq = np.array([[-1, -1, 0], [1, -1, 0], [-1, 1, 0], [1, 1, 0], [0, 0, 0]], float)
+    d = np.array([1.0, 1, 1, 1, 2])
+    D = _mahalanobis(sq, d)
+    w = _weights(sq, d, np.zeros(5, int), 1, "gaussian")
+    npt.assert_allclose(w, d * np.exp(-0.5 * D ** 2), rtol=1e-12)
+    S = 4 / 6                                             # the d-weighted variance per axis
+    npt.assert_allclose(w[:4], np.exp(-0.5 * 2 / S), rtol=1e-12)
+    npt.assert_allclose(w[:4], np.exp(-1.5), rtol=1e-12)
+    assert w[4] == 2.0
+
+
+def test_one_voxel_node_and_nodes_apart():
+    """A one-voxel node (D = 0) gets its density; each node is weighted on its own."""
     x = np.vstack([XSEC, [[50, 50, 50]]])
     d = np.r_[XSEC_D, 3.0]
     owner = np.r_[np.zeros(len(XSEC), int), 1]
-    w = _weights(x, d, owner, 2)
+    w = _weights(x, d, owner, 2, "gaussian")
     assert w[-1] == 3.0
-    alone = _weights(XSEC, XSEC_D.astype(float), np.zeros(len(XSEC), int), 1)
+    alone = _weights(XSEC, XSEC_D.astype(float), np.zeros(len(XSEC), int), 1, "gaussian")
     npt.assert_allclose(w[:-1], alone, rtol=1e-12)
 
 
-def test_zero_and_near_zero_distance():
-    """pyAFQ's rule: an infinite inverse distance becomes zero weight; a near-centre voxel keeps
-    its (large) finite d / D.  Symmetric square + its exact centre, then the centre nudged."""
-    sq = np.array([[-1, -1, 0], [1, -1, 0], [-1, 1, 0], [1, 1, 0], [0, 0, 0]], float)
-    d = np.ones(5)
-    w = _weights(sq, d, np.zeros(5, int), 1)
-    assert w[4] == 0 and np.all(w[:4] > 0)                 # the exact centre is discarded
-    nudged = sq.copy()
-    nudged[4, 0] = 1e-6
-    w2 = _weights(nudged, d, np.zeros(5, int), 1)
-    D = _mahalanobis(nudged, d)
-    npt.assert_allclose(w2, d / D)
-    assert w2[4] / w2.sum() > 0.99                        # ...and dominates the node
-
-
 def test_density_weighting_is_the_density_weighted_mean():
-    """weighting="density" ignores the cross-section geometry: w_i = d_i, including the voxel at
-    the centre that Mahalanobis weighting discards."""
+    """weighting="density" (the default) ignores the cross-section geometry: w_i = d_i."""
     sq = np.array([[-1, -1, 0], [1, -1, 0], [-1, 1, 0], [1, 1, 0], [0, 0, 0]], float)
     d = np.array([1.0, 2, 3, 4, 5])
-    npt.assert_array_equal(_weights(sq, d, np.zeros(5, int), 1, "density"), d)
+    npt.assert_array_equal(_weights(sq, d, np.zeros(5, int), 1), d)
     with pytest.raises(ValueError):
-        _weights(sq, d, np.zeros(5, int), 1, "gauss")
+        _weights(sq, d, np.zeros(5, int), 1, "mahalanobis")
 
 
 # --- position along the core ----------------------------------------------------------------
@@ -342,9 +332,9 @@ def test_profile_end_to_end():
     rev, _ = tract_profiles(d, aff, core[::-1], {"lin": nib.Nifti1Image(s_data, s_aff)})
     npt.assert_allclose(rev["lin"], prof["lin"][::-1], rtol=1e-12)
 
-    dens, _ = tract_profiles(d, aff, core, scalars, weighting="density")
-    npt.assert_allclose(dens["lin"], field(core), atol=0.12)
-    assert not np.allclose(dens["lin"], prof["lin"])
+    gauss, _ = tract_profiles(d, aff, core, scalars, weighting="gaussian")
+    npt.assert_allclose(gauss["lin"], field(core), atol=0.12)
+    assert not np.allclose(gauss["lin"], prof["lin"])
 
 
 def test_empty_bundle_returns_nan_nodes():
