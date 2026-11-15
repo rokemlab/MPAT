@@ -2,8 +2,9 @@
 
 For one bundle and its core (``mpat.core``, n nodes in world mm):
 
-1. Support.  The voxels ``bundle_core`` builds its graph on: density above ``floor`` x peak, in
-   the connected component that holds the peak.
+1. Voxels.  Every voxel with density > 0, with no density floor, connectivity or distance
+   cutoff: each one gets a place on the profile, and counts in proportion to its density (step 4),
+   so faint voxels and stray islands count for little without being dropped.
 2. Position along the core.  Each support voxel's centre is projected onto the nearest point of
    the core polyline -- onto its segments, not its vertices -- for a continuous arc length s and
    that segment's direction u.  Past either end s runs on along the end segment (s < 0, or beyond
@@ -41,7 +42,7 @@ For one bundle and its core (``mpat.core``, n nodes in world mm):
                finite everywhere: a one-voxel node, or one at the centre, just gets d_i.
 5. Profile.  P_n = sum w_i s_i / sum w_i over node n's voxels with a finite scalar s_i; NaN if
    there are none (info lists nodes with no voxels in ``empty_nodes``).  Scalars are put on the
-   density grid with ``afq._on_grid`` (linear); voxels outside a scalar's grid read 0 there.
+   density grid with ``afq._on_grid`` (linear); voxels outside a scalar's grid have no value for it.
 """
 from __future__ import annotations
 
@@ -53,7 +54,7 @@ import nibabel as nib
 import numpy as np
 
 from .afq import _on_grid
-from .core import _support, bundle_files
+from .core import bundle_files
 
 BLOCK = 1 << 20     # voxel x segment pairs per block of the nearest-segment search (memory bound)
 
@@ -161,7 +162,7 @@ def _weights(x, d, owner, n, weighting="density"):
     return w
 
 
-def tract_profiles(density, affine, core, scalars, n_nodes=100, floor=1e-6,
+def tract_profiles(density, affine, core, scalars, n_nodes=100,
                    weighting="density", kernel="linear"):
     """Profiles of one bundle: ({scalar: (n,) values}, info).
 
@@ -179,20 +180,24 @@ def tract_profiles(density, affine, core, scalars, n_nodes=100, floor=1e-6,
     core = np.asarray(core, float)
     n = len(core)
     dn = d / d.max()
-    ijk = np.argwhere(_support(dn, floor))
+    ijk = np.argwhere(dn > 0)
     x = nib.affines.apply_affine(affine, ijk)
     vox, node, share = _spread(x, core, affine, kernel)
     w = _weights(x[vox], dn[tuple(ijk.T)][vox] * share, node, n, weighting)
     out = {}
     ref = nib.Nifti1Image(d, affine)
     for name, img in scalars.items():
-        s = _on_grid(img, ref)[tuple(ijk.T)].astype(float)[vox]
+        s = _on_grid(img, ref)[tuple(ijk.T)].astype(float)
+        # outside the scalar's own grid there is no value (resampling would read 0 there)
+        own = nib.affines.apply_affine(np.linalg.inv(img.affine), x)
+        s[~np.all((own > -0.5) & (own < np.array(img.shape[:3]) - 0.5), axis=1)] = np.nan
+        s = s[vox]
         ok = np.isfinite(s) & (w > 0)
         num = np.bincount(node[ok], w[ok] * s[ok], n)
         den = np.bincount(node[ok], w[ok], n)
         out[name] = np.divide(num, den, out=np.full(n, np.nan), where=den > 0)
     count = np.bincount(node, minlength=n)
-    return out, dict(status="ok", n_support=len(ijk), empty_nodes=np.flatnonzero(count == 0).tolist())
+    return out, dict(status="ok", n_voxels=len(ijk), empty_nodes=np.flatnonzero(count == 0).tolist())
 
 
 def write_profiles(folder, scalars, weighting="density", kernel="linear"):

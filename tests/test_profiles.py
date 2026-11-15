@@ -271,12 +271,10 @@ def test_linear_kernel_is_the_projected_trilinear_hat():
 def test_spread_fills_nodes_closer_than_a_voxel():
     """Nodes every half voxel along a straight tube: giving each voxel to its nearest node leaves
     nodes without voxels, spreading gives every node a share, and each voxel's shares sum to one."""
-    from mpat.core import _support
-
     d, aff, _ = _straight_bundle()
     n = 40
     core = nib.affines.apply_affine(aff, np.stack([np.linspace(2, 21, n), np.full(n, 3.0), np.full(n, 3.0)], 1))
-    x = nib.affines.apply_affine(aff, np.argwhere(_support(d / d.max(), 1e-6)))
+    x = nib.affines.apply_affine(aff, np.argwhere(d > 0))
     nearest = np.linalg.norm(x[:, None] - core, axis=-1).argmin(1)
     assert len(np.setdiff1d(np.arange(n), nearest)) > 0
     vox, node, share = _spread(x, core, aff)
@@ -298,12 +296,12 @@ def _scalar_img():
 # --- integration and output -----------------------------------------------------------------
 
 def _straight_bundle():
-    """A 3x3-voxel tube along x (2 mm voxels), density peaking on its axis, plus a far island."""
+    """A 3x3-voxel tube along x (2 mm voxels), density peaking on its axis, plus a faint far island."""
     d = np.zeros((24, 7, 7))
     prof = np.array([0.4, 1.0, 0.4])
     d[2:22, 2:5, 2:5] = prof[None, :, None] * prof[None, None, :] * np.linspace(1, 2, 20)[:, None, None]
     d[2:22, 3, 3] += 0.05 * np.arange(20) % 3           # break the cross-sections' symmetry
-    d[23, 0, 0] = 1.0                                     # disconnected island: never in support
+    d[23, 0, 0] = 1e-3                                    # a disconnected island: still counted
     aff = np.diag([2.0, 2.0, 2.0, 1.0])
     aff[:3, 3] = [-10, 4, 7]
     n = 10
@@ -326,7 +324,7 @@ def test_profile_end_to_end():
     # each node's profile is a convex combination of a linear field over its own slab of the tube
     npt.assert_allclose(prof["lin"], field(core), atol=0.12)
     assert np.all(np.diff(np.sign(np.diff(prof["lin"]))) == 0)  # monotone along x, in node order
-    assert info["n_support"] == np.count_nonzero(d[:22])  # the island is not support
+    assert info["n_voxels"] == np.count_nonzero(d)       # every voxel with density, the island too
     assert info["empty_nodes"] == []
 
     rev, _ = tract_profiles(d, aff, core[::-1], {"lin": nib.Nifti1Image(s_data, s_aff)})
@@ -335,6 +333,18 @@ def test_profile_end_to_end():
     gauss, _ = tract_profiles(d, aff, core, scalars, weighting="gaussian")
     npt.assert_allclose(gauss["lin"], field(core), atol=0.12)
     assert not np.allclose(gauss["lin"], prof["lin"])
+
+
+def test_voxels_outside_a_scalars_grid_have_no_value():
+    """A scalar map covering only the first half of the tube: nodes beyond it are NaN, not pulled
+    towards 0, and the nodes inside match the full map's away from its edge."""
+    d, aff, core = _straight_bundle()
+    full = np.full(d.shape, 0.5)
+    prof, _ = tract_profiles(d, aff, core, {"s": nib.Nifti1Image(full, aff)})
+    half, _ = tract_profiles(d, aff, core, {"s": nib.Nifti1Image(full[:12], aff)})
+    npt.assert_allclose(prof["s"], 0.5, rtol=1e-6)
+    assert np.all(np.isnan(half["s"][-3:]))
+    npt.assert_allclose(half["s"][np.isfinite(half["s"])], 0.5, rtol=1e-6)
 
 
 def test_empty_bundle_returns_nan_nodes():
