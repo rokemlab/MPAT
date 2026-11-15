@@ -200,6 +200,8 @@ def test_box_cdf_is_the_sum_of_uniforms():
     z = np.linspace(-2, 2, 41)[None]
     npt.assert_allclose(_box_cdf(z, np.array([[2.0, 1.0, 1e-5]])), _box_cdf(z, np.array([[2.0, 1.0, 0.0]])),
                         atol=1e-5)
+    # six widths (the linear kernel): Irwin-Hall n = 6 is symmetric, and 1/720 at 1 (centred: -2)
+    npt.assert_allclose(_box_cdf(np.array([[0.0, -2.0]]), np.ones((1, 6))), [[0.5, 1 / 720]], atol=1e-12)
 
 
 def test_spread_shares_by_hand():
@@ -207,7 +209,7 @@ def test_spread_shares_by_hand():
     [4, 6] mm, so it is 1/4 node 4, 1/2 node 5 and 1/4 node 6."""
     aff = np.diag([2.0, 2.0, 2.0, 1.0])
     core = np.stack([np.arange(11.0), np.zeros(11), np.zeros(11)], 1)
-    vox, node, share = _spread(np.array([[5.0, 0, 0]]), core, aff)
+    vox, node, share = _spread(np.array([[5.0, 0, 0]]), core, aff, "box")
     npt.assert_array_equal(vox, 0)
     npt.assert_array_equal(node, [4, 5, 6])
     npt.assert_allclose(share, [0.25, 0.5, 0.25], atol=1e-12)
@@ -237,11 +239,43 @@ def test_spread_is_the_limit_of_supersampling():
     t = np.cumsum(np.r_[0, rng.uniform(0.4, 1.6, 30)])
     core = np.array([1, -2, 3.0]) + t[:, None] * u
     x = core[0] + rng.uniform(-4, t[-1] + 4, 16)[:, None] * u + rng.normal(0, 3, (16, 3))
-    vox, node, share = _spread(x, core, affine)
+    vox, node, share = _spread(x, core, affine, "box")
     W = np.zeros((len(x), len(core)))
     np.add.at(W, (vox, node), share)
     npt.assert_allclose(W.sum(1), 1, atol=1e-12)
     npt.assert_allclose(W, _supersampled_shares(x, affine, core), atol=1e-3)
+
+
+def test_linear_kernel_by_hand():
+    """The same voxel's trilinear hat is a tent on [3, 7] mm, density (2 - |z|) / 4: by hand its
+    shares of nodes 3..7 are 1/32, 1/4, 7/16, 1/4, 1/32."""
+    aff = np.diag([2.0, 2.0, 2.0, 1.0])
+    core = np.stack([np.arange(11.0), np.zeros(11), np.zeros(11)], 1)
+    _, node, share = _spread(np.array([[5.0, 0, 0]]), core, aff, "linear")
+    npt.assert_array_equal(node, [3, 4, 5, 6, 7])
+    npt.assert_allclose(share, [1 / 32, 1 / 4, 7 / 16, 1 / 4, 1 / 32], atol=1e-12)
+
+
+def test_linear_kernel_is_the_projected_trilinear_hat():
+    """Against the hat's projection computed independently: the six boxes convolved numerically on
+    a fine grid, then integrated over each node's bin (straight oblique core, sheared grid)."""
+    affine = np.array([[1.8, 0.3, 0, 5], [0, 2.2, -0.4, -3], [0.2, 0, 2.5, 1], [0, 0, 0, 1]])
+    u = np.array([2.0, 1.0, -0.5]) / np.linalg.norm([2.0, 1.0, -0.5])
+    core = np.arange(20)[:, None] * 0.9 * u
+    x = core[[3, 9, 15]] + [[0.3, -1, 0.5], [2, 0, -1], [-0.4, 0.2, 0.1]]
+    vox, node, share = _spread(x, core, affine, "linear")
+    W = np.zeros((len(x), len(core)))
+    np.add.at(W, (vox, node), share)
+    dz = 1e-3
+    pdf = np.ones(1)
+    for wk in np.repeat(np.abs(u @ affine[:3, :3]), 2):
+        pdf = np.convolve(pdf, np.ones(max(1, round(wk / dz))) / max(1, round(wk / dz)))
+    z = (np.arange(len(pdf)) - (len(pdf) - 1) / 2) * dz
+    s_node = (core - core[0]) @ u
+    edges = np.r_[-np.inf, (s_node[:-1] + s_node[1:]) / 2, np.inf]
+    for i, xi in enumerate(x):
+        k = np.searchsorted(edges, (xi - core[0]) @ u + z) - 1
+        npt.assert_allclose(W[i], np.bincount(k, pdf, len(core)), atol=2e-3)
 
 
 def test_spread_fills_nodes_closer_than_a_voxel():
