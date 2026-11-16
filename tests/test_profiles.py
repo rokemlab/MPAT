@@ -66,43 +66,15 @@ def test_density_weights_equal_replicated_points():
 
 @pytest.mark.parametrize("flat", [(2,), (1, 2)], ids=["planar", "linear"])
 def test_thin_cross_sections_use_the_pseudoinverse(flat):
-    """Rank-2 and rank-1 cross-sections are valid: pinvh agrees with pyAFQ, and every Gaussian
-    and inverse-distance weight is finite and positive (no fallback)."""
+    """Rank-2 and rank-1 cross-sections are valid: pinvh agrees with pyAFQ, and every
+    inverse-distance weight is finite and positive (no fallback)."""
     x = XSEC.copy()
     x[:, list(flat)] = 7.0
     x[:, 0] = XSEC[:, 0] + 0.1 * np.arange(len(x))      # keep the points distinct
     D_ref, _, _ = _pyafq_replicated(x, XSEC_D)
     npt.assert_allclose(_mahalanobis(x, XSEC_D.astype(float)), D_ref, rtol=1e-8)
-    for weighting in ("gaussian", "mahalanobis"):
-        w = _weights(x, XSEC_D.astype(float), np.zeros(len(x), int), 1, weighting)
-        assert np.all(np.isfinite(w) & (w > 0))
-
-
-def test_gaussian_weights_by_hand():
-    """w_i = d_i exp(-D_i^2 / 2): a symmetric square of unit densities and its centre.  The
-    d-weighted covariance is diag(2/3, 2/3, 0) (pinvh: the flat axis drops out), so a corner has
-    D^2 = 2 / (2/3) = 3 and weight exp(-1.5); the centre, D = 0, gets its full density -- the
-    voxel that pyAFQ's 1 / D would make infinite."""
-    sq = np.array([[-1, -1, 0], [1, -1, 0], [-1, 1, 0], [1, 1, 0], [0, 0, 0]], float)
-    d = np.array([1.0, 1, 1, 1, 2])
-    D = _mahalanobis(sq, d)
-    w = _weights(sq, d, np.zeros(5, int), 1, "gaussian")
-    npt.assert_allclose(w, d * np.exp(-0.5 * D ** 2), rtol=1e-12)
-    S = 4 / 6                                             # the d-weighted variance per axis
-    npt.assert_allclose(w[:4], np.exp(-0.5 * 2 / S), rtol=1e-12)
-    npt.assert_allclose(w[:4], np.exp(-1.5), rtol=1e-12)
-    assert w[4] == 2.0
-
-
-def test_one_voxel_node_and_nodes_apart():
-    """A one-voxel node (D = 0) gets its density; each node is weighted on its own."""
-    x = np.vstack([XSEC, [[50, 50, 50]]])
-    d = np.r_[XSEC_D, 3.0]
-    owner = np.r_[np.zeros(len(XSEC), int), 1]
-    w = _weights(x, d, owner, 2, "gaussian")
-    assert w[-1] == 3.0
-    alone = _weights(XSEC, XSEC_D.astype(float), np.zeros(len(XSEC), int), 1, "gaussian")
-    npt.assert_allclose(w[:-1], alone, rtol=1e-12)
+    w = _weights(x, XSEC_D.astype(float), np.zeros(len(x), int), 1, "mahalanobis")
+    assert np.all(np.isfinite(w) & (w > 0))
 
 
 def test_mahalanobis_weighting_reproduces_pyafq_on_replicated_points():
@@ -370,9 +342,9 @@ def test_profile_end_to_end():
     rev, _ = tract_profiles(d, aff, core[::-1], {"lin": nib.Nifti1Image(s_data, s_aff)})
     npt.assert_allclose(rev["lin"], prof["lin"][::-1], rtol=1e-12)
 
-    gauss, _ = tract_profiles(d, aff, core, scalars, weighting="gaussian")
-    npt.assert_allclose(gauss["lin"], field(core), atol=0.12)
-    assert not np.allclose(gauss["lin"], prof["lin"])
+    mahal, _ = tract_profiles(d, aff, core, scalars, weighting="mahalanobis")
+    npt.assert_allclose(mahal["lin"], field(core), atol=0.12)
+    assert not np.allclose(mahal["lin"], prof["lin"])
 
 
 def test_voxels_outside_a_scalars_grid_have_no_value():
