@@ -67,14 +67,15 @@ def test_density_weights_equal_replicated_points():
 @pytest.mark.parametrize("flat", [(2,), (1, 2)], ids=["planar", "linear"])
 def test_thin_cross_sections_use_the_pseudoinverse(flat):
     """Rank-2 and rank-1 cross-sections are valid: pinvh agrees with pyAFQ, and every Gaussian
-    weight is finite and positive."""
+    and inverse-distance weight is finite and positive (no fallback)."""
     x = XSEC.copy()
     x[:, list(flat)] = 7.0
     x[:, 0] = XSEC[:, 0] + 0.1 * np.arange(len(x))      # keep the points distinct
     D_ref, _, _ = _pyafq_replicated(x, XSEC_D)
     npt.assert_allclose(_mahalanobis(x, XSEC_D.astype(float)), D_ref, rtol=1e-8)
-    w = _weights(x, XSEC_D.astype(float), np.zeros(len(x), int), 1, "gaussian")
-    assert np.all(np.isfinite(w) & (w > 0))
+    for weighting in ("gaussian", "mahalanobis"):
+        w = _weights(x, XSEC_D.astype(float), np.zeros(len(x), int), 1, weighting)
+        assert np.all(np.isfinite(w) & (w > 0))
 
 
 def test_gaussian_weights_by_hand():
@@ -104,13 +105,52 @@ def test_one_voxel_node_and_nodes_apart():
     npt.assert_allclose(w[:-1], alone, rtol=1e-12)
 
 
+def test_mahalanobis_weighting_reproduces_pyafq_on_replicated_points():
+    """weighting="mahalanobis" with density d_i is pyAFQ's inverse-distance profile on each voxel
+    repeated d_i times -- which neither unweighted geometry nor density-only weighting gives."""
+    D_ref, w_ref, which = _pyafq_replicated(XSEC, XSEC_D)
+    w = _weights(XSEC, XSEC_D.astype(float), np.zeros(len(XSEC), int), 1, "mahalanobis")
+    expected = (w_ref * XSEC_S[which]).sum()              # pyAFQ weights already sum to one
+    npt.assert_allclose((w * XSEC_S).sum() / w.sum(), expected, rtol=1e-10)
+    D_unweighted = _mahalanobis(XSEC, np.ones(len(XSEC)))
+    unweighted = (XSEC_D / D_unweighted * XSEC_S).sum() / (XSEC_D / D_unweighted).sum()
+    density_only = (XSEC_D * XSEC_S).sum() / XSEC_D.sum()
+    assert abs(unweighted - expected) > 1e-3 and abs(density_only - expected) > 1e-3
+
+
+def test_mahalanobis_one_voxel_node_falls_back_locally():
+    """A one-voxel node (D = 0, so no finite inverse distance) is weighted by density alone; the
+    other nodes are untouched."""
+    x = np.vstack([XSEC, [[50, 50, 50]]])
+    d = np.r_[XSEC_D, 3.0]
+    owner = np.r_[np.zeros(len(XSEC), int), 1]
+    w = _weights(x, d, owner, 2, "mahalanobis")
+    assert w[-1] == 3.0
+    alone = _weights(XSEC, XSEC_D.astype(float), np.zeros(len(XSEC), int), 1, "mahalanobis")
+    npt.assert_allclose(w[:-1], alone, rtol=1e-12)
+
+
+def test_mahalanobis_zero_and_near_zero_distance():
+    """pyAFQ's rule: an infinite inverse distance becomes zero weight; a near-centre voxel keeps
+    its (large) finite d / D.  Symmetric square + its exact centre, then the centre nudged."""
+    sq = np.array([[-1, -1, 0], [1, -1, 0], [-1, 1, 0], [1, 1, 0], [0, 0, 0]], float)
+    d = np.ones(5)
+    w = _weights(sq, d, np.zeros(5, int), 1, "mahalanobis")
+    assert w[4] == 0 and np.all(w[:4] > 0)                 # the exact centre is discarded
+    nudged = sq.copy()
+    nudged[4, 0] = 1e-6
+    w2 = _weights(nudged, d, np.zeros(5, int), 1, "mahalanobis")
+    npt.assert_allclose(w2, d / _mahalanobis(nudged, d))
+    assert w2[4] / w2.sum() > 0.99                        # ...and dominates the node
+
+
 def test_density_weighting_is_the_density_weighted_mean():
     """weighting="density" (the default) ignores the cross-section geometry: w_i = d_i."""
     sq = np.array([[-1, -1, 0], [1, -1, 0], [-1, 1, 0], [1, 1, 0], [0, 0, 0]], float)
     d = np.array([1.0, 2, 3, 4, 5])
     npt.assert_array_equal(_weights(sq, d, np.zeros(5, int), 1), d)
     with pytest.raises(ValueError):
-        _weights(sq, d, np.zeros(5, int), 1, "mahalanobis")
+        _weights(sq, d, np.zeros(5, int), 1, "inverse")
 
 
 # --- position along the core ----------------------------------------------------------------

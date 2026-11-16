@@ -36,10 +36,16 @@ For one bundle and its core (``mpat.core``, n nodes in world mm):
                all of MPAT's streamlines see in the node's stretch -- with no cross-section geometry.
    "gaussian"  w_i = d_i exp(-D_i^2 / 2), D_i the Mahalanobis distance of the voxel centre from the
                node's d-weighted mean in its d-weighted covariance (pinvh, so thin cross-sections
-               are kept).  Favours the bundle's core as pyAFQ's ``gaussian_weights`` does, but where
-               pyAFQ weights by 1 / D -- infinite at the centre, which a few dozen voxels per
-               cross-section cannot average out (MPAT's profiles were 3x rougher with it) -- this is
-               finite everywhere: a one-voxel node, or one at the centre, just gets d_i.
+               are kept).  Favours the bundle's core, finite everywhere: a one-voxel node, or a
+               voxel at the centre, just gets d_i.
+   "mahalanobis"  w_i = d_i / D_i, the same D_i: pyAFQ's ``gaussian_weights`` (inverse
+               Mahalanobis distance) with every sum weighted by d.  As there, a voxel exactly at the
+               mean gets zero weight; a node whose weights are all zero (one voxel) is weighted by
+               d alone.  1 / D is unbounded near the centre, so with a few dozen voxels per node the
+               one or two nearest it carry the profile: on a curved phantom with voxel-level noise
+               (linear kernel) its profiles were 4.5x as rough as the true profile, against 3.7x
+               for "gaussian" and 1.5x for "density".  Unlike pyAFQ, no voxels are removed first
+               (pyAFQ drops streamlines more than 3 SD from any node's centre before weighting).
 5. Profile.  P_n = sum w_i s_i / sum w_i over node n's voxels with a finite scalar s_i; NaN if
    there are none (info lists nodes with no voxels in ``empty_nodes``).  Scalars are put on the
    density grid with ``afq._on_grid`` (linear); voxels outside a scalar's grid have no value for it.
@@ -152,13 +158,23 @@ def _weights(x, d, owner, n, weighting="density"):
     """Unnormalised profile weight of every voxel (step 4)."""
     if weighting == "density":
         return d
-    if weighting != "gaussian":
-        raise ValueError(f"weighting must be 'density' or 'gaussian', not {weighting!r}")
+    if weighting not in ("gaussian", "mahalanobis"):
+        raise ValueError(f"weighting must be 'density', 'gaussian' or 'mahalanobis', not {weighting!r}")
     w = np.zeros(len(x))
     for k in range(n):
         i = np.flatnonzero(owner == k)
-        if len(i):
-            w[i] = d[i] * np.exp(-0.5 * _mahalanobis(x[i], d[i]) ** 2)
+        if not len(i):
+            continue
+        D = _mahalanobis(x[i], d[i])
+        if weighting == "gaussian":
+            w[i] = d[i] * np.exp(-0.5 * D ** 2)
+            continue
+        with np.errstate(divide="ignore", invalid="ignore"):
+            wk = d[i] / D
+        # inverse distances that are not finite get no weight, as in pyAFQ:
+        # https://github.com/tractometry/pyAFQ/blob/65a43a88ff1cf1e681a04a47010c9bb8dbb07ed8/AFQ/_fixes.py#L355-L357
+        wk[~np.isfinite(wk)] = 0
+        w[i] = wk if wk.sum() > 0 else d[i]
     return w
 
 
@@ -170,7 +186,7 @@ def tract_profiles(density, affine, core, scalars, n_nodes=100,
     core      (n, 3) core nodes in world mm (``Core.xyz``), or None when there is none
     scalars   {name: nibabel image}
     n_nodes   the node count when there is no core; otherwise the core's own count is kept
-    weighting "density" (default) or "gaussian" (step 4)
+    weighting "density" (default), "gaussian" or "mahalanobis" (step 4)
     kernel    "linear" (default) or "box": how each voxel is spread along the core (step 3)
     """
     d = np.clip(np.nan_to_num(np.asarray(density, float)), 0, None)   # as bundle_core
