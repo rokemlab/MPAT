@@ -415,3 +415,19 @@ def test_write_profiles(tmp_path):
     assert meta["bundles"]["Empty one"]["status"] == "empty"
     assert meta["bundles"]["Left Arcuate"]["status"] == "ok"
     assert meta["scalars"] == {"dti_fa": str(fa)}
+
+    # n_nodes resamples each core (same ends, equal spacing): 4 nodes for every bundle, and the
+    # profile is tract_profiles on that core
+    from mpat.core import _resample
+
+    with open(write_profiles(tmp_path, {"dti_fa": fa}, n_nodes=4)) as fh:
+        rows = list(csv.DictReader(fh))
+    by = {}
+    for r in rows:
+        by.setdefault(r["tractID"], []).append(r)
+    assert [len(v) for v in by.values()] == [4, 4]
+    four = _resample(core, 4)
+    npt.assert_allclose(four[[0, -1]], core[[0, -1]])
+    expected, _ = tract_profiles(d, aff, four, {"dti_fa": nib.load(fa)})
+    npt.assert_allclose([float(r["dti_fa"]) for r in by["Left Arcuate"]], expected["dti_fa"], rtol=1e-6)
+    assert json.load(open(out[: -len(".csv")] + ".json"))["n_nodes"] == 4

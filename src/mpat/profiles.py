@@ -58,7 +58,7 @@ import nibabel as nib
 import numpy as np
 
 from .afq import _on_grid
-from .core import bundle_files
+from .core import _resample, bundle_files
 
 BLOCK = 1 << 20     # voxel x segment pairs per block of the nearest-segment search (memory bound)
 
@@ -210,13 +210,15 @@ def tract_profiles(density, affine, core, scalars, n_nodes=100,
     return out, dict(status="ok", n_voxels=len(ijk), empty_nodes=np.flatnonzero(count == 0).tolist())
 
 
-def write_profiles(folder, scalars, weighting="density", kernel="linear"):
+def write_profiles(folder, scalars, weighting="density", kernel="linear", n_nodes=None):
     """Profiles of every MPAT bundle under ``folder`` from its saved core (``write_cores``), as
     pyAFQ-style ``<stem>_desc-profiles_tractography.csv`` (tractID, nodeID, one column per scalar;
     missing values empty) and a ``.json`` with each bundle's status.
 
     scalars   {column name: path of a scalar image}, e.g. pyAFQ's exported ``dti_fa``
     weighting, kernel  passed to ``tract_profiles``
+    n_nodes   resample each core to this many equally spaced nodes, same ends (default: the core's
+              own count, 100 from ``write_cores``); fewer nodes, longer stretches, more voxels each
     """
     files = bundle_files(str(folder))
     out = next(iter(files.values()))["prefix"].split("_bundle-")[0] + "_desc-profiles_tractography.csv"
@@ -228,8 +230,10 @@ def write_profiles(folder, scalars, weighting="density", kernel="linear"):
         img = nib.load(f["density"])
         core_tsv = f["prefix"] + "_desc-core_path.tsv"
         core = np.loadtxt(core_tsv, skiprows=1, usecols=(1, 2, 3), ndmin=2) if op.exists(core_tsv) else None
+        if core is not None and n_nodes:
+            core = _resample(core, n_nodes)
         prof, meta[name] = tract_profiles(img.dataobj, img.affine, core, images, weighting=weighting,
-                                          kernel=kernel)
+                                          kernel=kernel, n_nodes=n_nodes or 100)
         for i, values in enumerate(zip(*prof.values())):
             rows.append([name, i] + ["" if np.isnan(v) else repr(float(v)) for v in values])
     with open(out, "w", newline="") as fh:
@@ -238,6 +242,6 @@ def write_profiles(folder, scalars, weighting="density", kernel="linear"):
         w.writerows(rows)
     with open(out[: -len(".csv")] + ".json", "w") as fh:
         json.dump(dict(method="mpat.profiles (see its docstring); nodeID 0 is the core's start end",
-                       weighting=weighting, kernel=kernel,
+                       weighting=weighting, kernel=kernel, n_nodes=n_nodes,
                        scalars={k: str(p) for k, p in scalars.items()}, bundles=meta), fh, indent=1)
     return out
