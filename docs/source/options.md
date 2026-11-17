@@ -11,6 +11,14 @@
 | `bundles` | `--bundles` | all in pyAFQ's bundle dictionary | pyAFQ names, e.g. `"Left Arcuate"`; output files drop the spaces (`bundle-LeftArcuate`) |
 | `cores` | – | `True` | also write each bundle's core |
 
+`schrodinger=True` (`--schrodinger`) launches the streamlines from gray matter instead of
+white-matter seeds, weighted so that they end in gray matter in proportion to its volume,
+exactly ({ref}`bridge`). Off by default; not with moments.
+
+Bundle sets beyond pyAFQ's defaults come with the bundle dictionary (`mpat.bundles.mpat_bd`), or
+on the command line as flags: `--synthseg-cst`, `--pontocerebellar` and `--cerebellar`
+({doc}`brainstem`).
+
 ## Choosing them
 
 **`max_mem`.** Each bundle needs one *column* per pair (avoid set, end kind) (see

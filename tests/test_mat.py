@@ -10,7 +10,8 @@ from scipy import ndimage
 from mpat import kernel as K
 from mpat.chain import Chain, ChainConfig
 from mpat.geometry import build_geometry
-from mpat.solve import prepare_launches, segment_bundles, solve_series
+from mpat.solve import (BRIDGE_TOL, GM, end_bridge, end_launches, geometry_target, prepare_launches,
+                        segment_bundles, solve_series)
 
 
 # ------------------------------------------------------------------ fixtures
@@ -293,3 +294,119 @@ def test_pyafq_end_to_end(tmp_path):
     page = save_html(tmp_path / "view.html", out, glyphs=True)
     html = open(page).read()
     assert '"role": "glyphs"' in html and "followGlyphs" in html and "cdn.jsdelivr.net/npm/@niivue/niivue@" in html
+
+
+# ------------------------------------------------------------------ warm starts, Schrödinger bridge
+def test_warm_start_gives_the_same_answer(crossing):
+    *_, ch = crossing
+    rng = np.random.default_rng(3)
+    x0 = rng.random((ch.n_states, 2))
+    mask = np.ones(x0.shape, np.uint8)
+    cold, ic = solve_series(ch.mul_forward, x0.copy(), mask, 1e-12, 5000, "cold")
+    guess = cold * (1 + 0.05 * rng.standard_normal(cold.shape))      # a previous, nearby solution
+    warm, iw = solve_series(ch.mul_forward, x0.copy(), mask, 1e-12, 5000, "warm", guess=guess)
+    assert np.abs(warm - cold).max() < 1e-9 * cold.max()
+    assert iw["iterations"] <= ic["iterations"]
+
+
+def test_end_weights_scale_each_end(crossing):
+    sh, wm, cls, reg, seeds, A, B, end, ch = crossing
+    L = prepare_launches(ch, seeds)
+    start = np.zeros_like(wm)
+    start[:2] = True
+    start &= reg["capx"]
+    spec = dict(name="x", start=start, end=end)
+    plain = segment_bundles(ch, [spec], L)["x"]
+    p = np.zeros(ch.pshape, bool)
+    p[1:-1, 1:-1, 1:-1] = end
+    w = np.where(p.ravel()[ch.a_lin], 2.0, 1.0)      # every streamline has exactly one end in `end`
+    tilted = segment_bundles(ch, [spec], L, end_weights=w)["x"]
+    assert plain.seed_prob.sum() > 0
+    assert np.allclose(tilted.seed_prob, 2 * plain.seed_prob, rtol=1e-9, atol=1e-15)
+    assert np.allclose(tilted.density_t, 2 * plain.density_t, rtol=1e-9, atol=1e-15)
+
+
+def test_end_launches_reverse_the_arrivals(crossing):
+    from mpat.geometry import OFFSETS
+
+    *_, ch = crossing
+    sites = np.flatnonzero(ch.a_class == GM)
+    E = end_launches(ch, sites)
+    tot = np.asarray(E.lam.sum(0)).ravel()
+    assert np.allclose(tot[E.w > 0], 1) and (E.w > 0).sum() > 0.5 * sites.size
+    _, R = _csr(ch)
+    a = int(np.argmax(E.w > 0))
+    s_in = R[:, sites[a]].nonzero()[0]                  # states that step into the site
+    s_out = E.lam[:, a].nonzero()[0]                    # states a launch from it starts in
+    flip = {c: int(np.flatnonzero((OFFSETS == -o).all(1))[0]) for c, o in enumerate(OFFSETS)}
+    assert sorted(s_out) == sorted((s_in // ch.nb) * ch.nb + np.array([flip[c] for c in s_in % ch.nb]))
+
+
+def test_end_launched_bundle_matches_a_direct_solve(crossing):
+    import scipy.sparse as sps
+    import scipy.sparse.linalg as spla
+
+    sh, wm, cls, reg, seeds, A, B, end, ch = crossing
+    start = np.zeros_like(wm)
+    start[:2] = True
+    start &= reg["capx"]
+    E = end_launches(ch, np.flatnonzero(ch.a_class == GM))
+    res = segment_bundles(ch, [dict(name="x", start=start, end=end)], E, tol=1e-13)["x"]
+    assert abs(res.info["endpoint_mass_check"] - 1) < 1e-9
+    Q, R = _csr(ch)
+
+    def ends_in(m):                                     # P(a walk from each state ends in m)
+        p = np.zeros(ch.pshape, bool)
+        p[1:-1, 1:-1, 1:-1] = m
+        e = p.ravel()[ch.a_lin] & np.isin(ch.a_class, [1, 3])
+        return spla.spsolve((sps.identity(ch.n_states) - Q).tocsc(), R @ e.astype(float)), p.ravel()[ch.a_lin]
+
+    to_end, in_end = ends_in(end)
+    to_start, in_start = ends_in(start)
+    site_s, site_e = in_start[E.sites], in_end[E.sites]
+    want = E.w * (site_s * (E.lam.T @ to_end) + site_e * (E.lam.T @ to_start))
+    assert want.sum() > 0
+    assert np.abs(res.seed_prob - want).max() < 1e-9 * want.max()
+
+
+def test_end_bridge_meets_the_geometry_target(crossing):
+    sh, wm, cls, reg, seeds, A, B, end, ch = crossing
+    t = geometry_target(ch, cls == GM, (1.0, 1.0, 1.0))
+    assert t.sum() == (cls == GM).sum() and (t[ch.a_class != GM] == 0).all()
+    E, g, info = end_bridge(ch, t, tol=1e-10)
+    assert info["arrivals_l1_from_target"] < BRIDGE_TOL and info["left_out"] == 0
+    allb = segment_bundles(ch, [dict(name="all")], E, tol=1e-10, end_weights=g)["all"]
+    gm = ch.a_class == GM
+
+    def off(e):                                         # how far the ends are from proportional to the target
+        return np.abs(e[gm] / e[gm].sum() - t[gm] / t[gm].sum()).sum()
+
+    assert off(allb.endpoints_a) < 2 * BRIDGE_TOL
+    launched = np.zeros(ch.a_lin.size)
+    np.add.at(launched, E.sites, allb.seed_prob)
+    assert np.abs(launched[gm] - t[gm] / 2).sum() / t[gm].sum() < 1e-6        # one launch per 2 mm^3
+    plain = segment_bundles(ch, [dict(name="all")], end_launches(ch, E.sites, t[E.sites]), tol=1e-10)["all"]
+    assert off(plain.endpoints_a) > 10 * BRIDGE_TOL                          # it did change them
+
+
+def test_pyafq_end_to_end_schrodinger(tmp_path):
+    import json
+
+    pytest.importorskip("AFQ")
+    from synthetic_subject import make_afq, make_subject
+
+    import mpat
+
+    f = make_subject(tmp_path / "raw")
+    res = mpat.run(make_afq(f, tmp_path / "afq"), n_proc=2, max_mem="2GB", viz=False, cores=False,
+                   schrodinger=True)
+    out = tmp_path / "afq" / "mpat"
+    info = json.loads((out / "sub-01_desc-bridge.json").read_text())
+    assert info["arrivals_l1_from_target"] < 1e-3 and (out / "sub-01_desc-bridgearrival_map.nii.gz").exists()
+    assert (out / "sub-01_bundle-A_desc-launches_map.nii.gz").exists()
+    for b in res:
+        assert res[b].info["expected_bundle_streamlines"] > 0
+    again = mpat.run(make_afq(f, tmp_path / "afq"), n_proc=2, max_mem="2GB", viz=False, cores=False,
+                     schrodinger=True)              # from the cache: the same bundles
+    for b in res:
+        assert np.allclose(again[b].density_t, res[b].density_t)

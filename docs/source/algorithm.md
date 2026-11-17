@@ -393,7 +393,63 @@ and the stem's keeps the vertical one.
 `bundle_core` stage by stage on the arc bundle.
 ```
 
-## 14. Checks
+(bridge)=
+## 14. Streamlines from gray matter: the Schrödinger bridge
+
+With `schrodinger=True` (`--schrodinger`), streamlines are launched from gray matter instead
+of from white-matter seeds, and weighted so that they end in gray matter in proportion to its
+volume. Tractography's streamlines otherwise end mostly on gyral crowns and seldom in sulcal
+banks and fundi, more than the anatomy supports {cite}`schilling2018confirmation`.
+
+**The target.** Each gray-matter voxel is assigned to the nearest gray-matter voxel walkers
+stop in; that end voxel's target is the gray matter assigned to it, in mm³
+(`mpat.solve.geometry_target`). A crown, with more gray matter over each white-matter face,
+gets more than a sulcal bank or fundus.
+
+**Launches.** Every end voxel with a target launches walkers into white matter
+(`mpat.solve.end_launches`). A launch is the reverse of an arrival: each white-matter state
+that steps into the voxel with probability $R(s, a)$ launches, with that weight, into the
+same voxel with the opposite heading. A streamline is one walk, from its launch voxel $a$ to
+where it is absorbed, $b$, if that end is valid: no white-matter seeds, no peak pairs, no
+half-walks.
+
+**The bridge.** Launching from gray matter makes the launches uniform by construction; the
+arrivals are not. Of all ways to weight the streamlines so that both match the target, the
+Schrödinger bridge is the one closest to the end-launched walk in relative entropy
+{cite}`leonard2014survey`. It weights a streamline
+$$
+f(a)\;P(\text{path} \mid \text{launched at } a)\;g(b),
+$$
+so paths keep their transition probabilities. The launch weights $f$ make each voxel launch
+half of its target (one streamline per 2 mm³ of gray matter), and the arrival factors $g$
+make the arrivals proportional to the target. Ends without a target (the edge of the field of
+view, where fibres leave it) share one factor and keep the reference's share of the
+arrivals. Every gray-matter end voxel then ends streamlines in proportion to its gray matter.
+
+**Finding $f$ and $g$** (`mpat.solve.end_bridge`) alternates: a backward solve with $g$
+gives each voxel's launch completion $h$ and $f = \text{target}/(2h)$; a forward solve from
+$f$ gives the arrivals and $g \leftarrow g \cdot \text{target}/\text{arrivals}$. Each solve
+starts from the previous round's solution: the series then sums only the correction, from the
+residual $e = x_0 + MA\,x_{\text{prev}} - x_{\text{prev}}$, to the same tolerance. Rounds far
+from the target solve only as accurately as that distance needs; the last round solves to
+`tol`. The bridge is unique, so none of this changes the answer: the rounds stop when the
+arrivals, from solves to `tol`, are within $10^{-3}$ of their target (L1). A voxel no
+streamline arrives at launches its whole target; one whose launches never end validly
+receives it all; one with neither is left out.
+
+**Bundles** are then the end-launched streamlines their rules select, with $f$ as the
+launches and $g$ as the arrival voxels' weights: a streamline's launch voxel is one end, its
+absorption the other, and the same end kinds and avoid sets apply. Bundle solves cost what
+they did before. The weights are cached per subject (`<sub>_desc-bridge_cache.npz`) and
+written as maps ({doc}`outputs`). Not with moments.
+
+**Where the bridge acts.** Its transitions are the walk's, times $h(s')/h(s)$. Deep in white
+matter $h$ averages $g$ over many reachable ends and hardly changes, so the walk is nearly
+unchanged; near cortex it follows $g$, and walkers are steered in their last steps. The
+cheapest way to move ends between neighbouring voxels is a short detour on arrival, which is
+where tractography's gyral bias comes from.
+
+## 15. Checks
 
 - **Monte Carlo agreement.** {numref}`fig-mc-vs-exact`, and the test suite
   (`tests/test_docs_phantom.py`), check that sampled streamlines converge to MPAT's density.

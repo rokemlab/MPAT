@@ -47,6 +47,8 @@ MITTENS v2 (`mittens-dmri`) is not on PyPI yet, so pip builds it from GitHub wit
 | `bundles` | `--bundles` | all in pyAFQ's bundle dictionary | pyAFQ names, e.g. "Left Arcuate"; output files drop the spaces (`bundle-LeftArcuate`) |
 | `viz` | `--no-viz` | on | the collage and viewer pages below |
 
+Three flags add bundle sets: `--synthseg-cst` (corticospinal tracts from the subject's own SynthSeg labels: the central cortex to where the brainstem leaves the field of view), `--pontocerebellar` (from each lobe's cortex to the other side's cerebellar cortex through its middle cerebellar peduncle, crossing the midline only in the brainstem; 10 bundles) and `--cerebellar` (pyAFQ's cerebellar peduncles). See `docs/source/brainstem.md`.
+
 Any pyAFQ setting goes on the `ParticipantAFQ`; with the CLI, pass it as `--afq-kwargs`. That covers the fODF model (`tracking_params={"odf_model": ...}`), the PVE, custom bundle dictionaries including subject-space ROIs, and `segmentation_params={"dist_to_atlas": ...}`. `--afq-kwargs` takes JSON, or a Python expression that gives a dict, for settings that are Python objects. The expression sees `afd` (`AFQ.data.fetch`), `abd` (`AFQ.api.bundle_dict`), the `AFQ.definitions` image and mapping classes, `np` and `nib`. For example, an infant run:
 
 ```bash

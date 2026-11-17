@@ -9,7 +9,7 @@ def main(argv=None):
     p.add_argument("dwi"), p.add_argument("bval"), p.add_argument("bvec")
     p.add_argument("t1", help="T1w image, registered to the DWI (pyAFQ's t1_file)")
     p.add_argument("output_dir")
-    p.add_argument("--n-proc", type=int, help="threads (required unless --rois-only)")
+    p.add_argument("--n-proc", type=int, required=True, help="threads")
     p.add_argument("--max-mem", default="auto",
                    help="memory budget, e.g. 16GB, or auto (default): min(80%%, limit - 10 GB) of the job's "
                         "memory limit (cgroup / SLURM / physical), less what is already in use")
@@ -30,10 +30,6 @@ def main(argv=None):
                    help="keep the template's thalamic start / end ROIs (default: SynthSeg's thalami)")
     p.add_argument("--no-viz", action="store_true",
                    help="skip the collage and viewer pages (written by default)")
-    p.add_argument("--midline-tol", type=float, default=None,
-                   help="mm past the midline the corticospinal tracts may go before the other hemisphere "
-                        "is excluded (default: their rule, 10; 0: strict cut at x = 0); other one-sided "
-                        "bundles follow their rules in mpat.bundles (default: cut at x = 0)")
     p.add_argument("--no-midline", nargs="+", default=(), metavar="BUNDLE",
                    help="ignore cross_midline=False for these bundles (no other-hemisphere exclusion)")
     p.add_argument("--no-fornix-exclude", action="store_true",
@@ -41,18 +37,31 @@ def main(argv=None):
                         "of the fornix / septum on the midline (MNI box x -3..3, y -28..15, z -5..22 mm)")
     p.add_argument("--synthseg-cst", action="store_true",
                    help="corticospinal tracts from SynthSeg endpoints only: precentral, paracentral and postcentral "
-                        "cortex to the brainstem, "
-                        "no waypoints, the same midline rule (mpat.bundles.synthseg_cst_bd); runs SynthSeg's "
-                        "cortical parcellation and hypothalamus models once per subject if not done yet "
-                        "(<stem>_model-synthseg2parc_dseg.nii.gz); with --pyafq, pyAFQ gets the same ends")
+                        "cortex to where the brainstem leaves the field of view at the bottom, outside the "
+                        "cerebellum, no waypoints, the same midline rule (mpat.bundles.synthseg_cst_bd); runs "
+                        "SynthSeg's cortical parcellation and hypothalamus models once per subject if not done yet "
+                        "(<stem>_model-synthseg2parc_dseg.nii.gz); with --pyafq, pyAFQ gets the same start and "
+                        "the brainstem as its end")
+    p.add_argument("--pontocerebellar", action="store_true",
+                   help="add the cortico-ponto-cerebellar tracts: from each lobe's cortex (frontal, parietal, "
+                        "temporal, occipital, insular; SynthSeg's parcellation) to the other side's cerebellar "
+                        "cortex through its middle cerebellar peduncle (pyAFQ's template waypoints), crossing "
+                        "the midline only in the brainstem (mpat.bundles.pontocerebellar_bd; 10 bundles, MPAT "
+                        "only)")
+    p.add_argument("--cerebellar", action="store_true",
+                   help="add pyAFQ's cerebellar peduncles (AFQ.api.bundle_dict.cerebellar_bd: the inferior, middle "
+                        "and superior peduncles of each side, from template waypoints, the middle and superior "
+                        "crossing only in the brainstem; 6 bundles, also given to "
+                        "pyAFQ with --pyafq)")
+    p.add_argument("--schrodinger", action="store_true",
+                   help="launch streamlines from gray matter instead of white-matter seeds, weighted so that "
+                        "every gray-matter end voxel launches half and receives half of the gray-matter volume "
+                        "behind it: one streamline end per mm^3 of gray matter, exactly (a Schrödinger bridge; "
+                        "paths keep their transition probabilities; mpat.solve.end_bridge, cached per subject; "
+                        "not with --moments)")
     p.add_argument("--pyafq", action="store_true",
                    help="also run pyAFQ's own pipeline (tractography, segmentation, profiles; export_all) "
                         "on the same ParticipantAFQ, for comparison: same inputs, kwargs and derivatives")
-    p.add_argument("--rois-only", action="store_true",
-                   help="solve nothing: write a finished run's ROI masks (start / end / include / exclude) "
-                        "and a viewer page showing them, <stem>_desc-mpat_rois.html")
-    p.add_argument("--viz-rois", action="store_true",
-                   help="viewer pages also show each bundle's include (green) / exclude (red) ROIs")
     p.add_argument("--afq-kwargs", default="{}",
                    help="extra ParticipantAFQ arguments: JSON, or a Python expression giving a dict, "
                         "with afd (AFQ.data.fetch), abd (AFQ.api.bundle_dict), mb (mpat.bundles) and the "
@@ -62,16 +71,20 @@ def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     from AFQ.api.participant import ParticipantAFQ
 
-    from .afq import run, write_rois
+    from .afq import run
 
     kwargs = afq_kwargs(a.afq_kwargs)
     if "bundle_info" not in kwargs:              # MPAT's bundles: pyAFQ's defaults + the HCC + the fornix
         from .bundles import mpat_bd
 
-        kwargs["bundle_info"] = mpat_bd(synthseg_cst=a.synthseg_cst)
+        kwargs["bundle_info"] = mpat_bd(synthseg_cst=a.synthseg_cst, pontocerebellar=a.pontocerebellar,
+                                        cerebellar=a.cerebellar)
     elif a.synthseg_cst:
         p.error("--synthseg-cst replaces the CSTs of MPAT's default bundles; with your own bundle_info, "
                 "add mb.synthseg_cst_bd() to it instead")
+    elif a.pontocerebellar or a.cerebellar:
+        p.error("--pontocerebellar / --cerebellar add to MPAT's default bundles; with your own bundle_info, "
+                "add mb.pontocerebellar_bd() / abd.cerebellar_bd() to it instead")
     if "tracking_params" in kwargs:
         if "odf_model" not in kwargs["tracking_params"]:
             kwargs["tracking_params"]["odf_model"] = "CSD"
@@ -79,19 +92,11 @@ def main(argv=None):
         kwargs["tracking_params"] = {"odf_model": "CSD"}
 
     afq = ParticipantAFQ(a.dwi, a.bval, a.bvec, a.t1, a.output_dir, **kwargs)
-    if a.rois_only:
-        page = write_rois(afq, a.bundles, a.moments, synthseg_thalamus=not a.mni_thalamus, no_midline=a.no_midline,
-                          midline_tol=a.midline_tol, out_dir=a.out_dir,
-                          fornix=not a.no_fornix_exclude)
-        logging.getLogger("mpat").info("ROI page: %s", page)
-        return
-    if a.n_proc is None:
-        p.error("--n-proc is required (except with --rois-only)")
     run(afq, a.n_proc, a.max_mem, a.bundles, a.moments, a.tol, a.angle, not a.single_odf, viz=not a.no_viz,
         synthseg_thalamus=not a.mni_thalamus,
-        max_length=a.max_length, viz_rois=a.viz_rois, no_midline=a.no_midline,
-        midline_tol=a.midline_tol, out_dir=a.out_dir, verbose=a.verbose,
-        fornix=not a.no_fornix_exclude)
+        max_length=a.max_length, no_midline=a.no_midline,
+        out_dir=a.out_dir, verbose=a.verbose,
+        fornix=not a.no_fornix_exclude, schrodinger=a.schrodinger)
     if a.pyafq:   # pyAFQ's recognition: MPAT's rules removed, MPAT-only bundles (fornix) dropped
         from .bundles import pyafq_bd
 

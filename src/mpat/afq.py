@@ -20,7 +20,8 @@ import numpy as np
 
 from .chain import ABSORB_CLASSES, Chain, ChainConfig
 from .geometry import visitation_odf
-from .solve import Clock, overlength_states, prepare_launches, segment_bundles
+from .solve import (BRIDGE_TOL, Clock, end_bridge, end_launches, geometry_target, overlength_states,
+                    prepare_launches, segment_bundles)
 
 log = logging.getLogger("mpat")
 WM_THRESHOLD = 0.4   # pyAFQ's tracker stops where WM PVE <= gm_threshold (0.4)
@@ -135,10 +136,11 @@ def _subject_thalamus(name, k, roi, thalamus, x, tol):
     return thalamus[side].copy()
 
 
-def bundle_specs(afq, ref_img, transient, names=None, thalamus=None, no_midline=(), midline_tol=None,
-                 fornix=True):
+def bundle_specs(afq, ref_img, transient, names=None, thalamus=None, no_midline=(),
+                 fornix=True, absorb=None):
     """bundle_specs_iter as a list (every bundle's ROIs at once)."""
-    return list(bundle_specs_iter(afq, ref_img, transient, names, thalamus, no_midline, midline_tol, fornix))
+    return list(bundle_specs_iter(afq, ref_img, transient, names, thalamus, no_midline, fornix,
+                                  absorb=absorb))
 
 
 def mni_box(box, bd, mapping, ref_img):
@@ -157,8 +159,8 @@ def mni_box(box, bd, mapping, ref_img):
     return _on_grid(nib.Nifti1Image(np.asarray(warped, np.float32), ref_img.affine), ref_img, order=0) > 0
 
 
-def bundle_specs_iter(afq, ref_img, transient, names=None, thalamus=None, no_midline=(), midline_tol=None,
-                      fornix=True, hypo_file=None, parc_file=None):
+def bundle_specs_iter(afq, ref_img, transient, names=None, thalamus=None, no_midline=(),
+                      fornix=True, hypo_file=None, parc_file=None, absorb=None):
     """MPAT bundle specs from pyAFQ's bundle dictionary and MPAT's rules (mpat.bundles): include /
     exclude ROIs (sealed), start / end ROIs grown by pyAFQ's ``dist_to_atlas``, and the other
     hemisphere excluded for bundles that may not cross the midline.  Other pyAFQ criteria
@@ -167,8 +169,6 @@ def bundle_specs_iter(afq, ref_img, transient, names=None, thalamus=None, no_mid
     solving and no others.
 
     no_midline  bundle names whose cross_midline=False is ignored (no other-hemisphere exclusion)
-    midline_tol overrides the midline_tol rule of the bundles that have one (the corticospinal
-                tracts); None: the rules' own
     fornix      False: drop the fornix box (mpat.bundles.FORNIX_BOX_MNI) from the exclusions
                 (the anterior thalamic radiations as pyAFQ defines them)
     parc_file   where SynthSeg with its cortical parcels and hypothalamus is kept (written on
@@ -176,6 +176,8 @@ def bundle_specs_iter(afq, ref_img, transient, names=None, thalamus=None, no_mid
                 hypothalamus and no hypo_file has it)
     hypo_file   where SynthSeg with the hypothalamus is kept, when a bundle's SynthSeg ROIs use
                 the hypothalamus (the fornix) and pyAFQ's SynthSeg lacks it (_synthseg_on_grid)
+    absorb      the absorbing classes (tissue_labels): needed by bundles whose start / end is
+                the edge of the field of view (the start_edge / end_edge rules)
     thalamus    {"left": mask, "right": mask} on ``ref_img``'s grid (SynthSeg's): a start / end
                 ROI that is the template's thalamus -- at least half of it within ``dist_to_atlas``
                 of a thalamus, or its centre inside one -- is replaced by the subject's thalamus
@@ -201,6 +203,14 @@ def bundle_specs_iter(afq, ref_img, transient, names=None, thalamus=None, no_mid
             log.info("MNI box %s: %d voxels on this grid", dict(b), int(boxes[key].sum()))
         return boxes[key]
 
+    def synthseg(values):
+        # SynthSeg on this grid with the labels ``values`` need (rerun once with the extra models)
+        nonlocal seg, seg_has
+        if seg is None or not _extras(values) <= seg_has:
+            seg = _synthseg_on_grid(afq, ref_img, values, hypo_file=hypo_file, parc_file=parc_file)
+            seg_has = _extras(np.unique(seg))
+        return seg
+
     for name in (names or list(bd)):
         r = rules(bd, name)
         rois = bd.transform_rois(name, mapping, ref_img)
@@ -209,15 +219,18 @@ def bundle_specs_iter(afq, ref_img, transient, names=None, thalamus=None, no_mid
         spec["include"] += [box(b) for b in r["include_mni_boxes"]]
         exc = [seal_26(arr(m)) for m in rois.get("exclude", [])]
         exc += [box(b) for b in r["exclude_mni_boxes"] if fornix or dict(b) != FORNIX_BOX_MNI]
+        if r["exclude_synthseg"]:
+            values = synthseg_values(r["exclude_synthseg"])
+            m = np.isin(synthseg(values), values)
+            exc.append(m)                     # a region, not a sheet: no seal_26 (it would eat its neighbors)
+            log.info("%s exclude: SynthSeg %s (%d voxels)", name, ", ".join(map(str, r["exclude_synthseg"])),
+                     int(m.sum()))
         spec["exclude_rois"] = np.any(exc, axis=0) if exc else None      # without the hemisphere (for display)
         for k in ("start", "end"):
             labels = r[f"{k}_synthseg"]
             if labels:
                 values = synthseg_values(labels)
-                if seg is None or not _extras(values) <= seg_has:
-                    seg = _synthseg_on_grid(afq, ref_img, values, hypo_file=hypo_file, parc_file=parc_file)
-                    seg_has = _extras(np.unique(seg))
-                roi = np.isin(seg, values)
+                roi = np.isin(synthseg(values), values)
                 if not roi.any():
                     log.warning("%s %s: SynthSeg labels %s are empty on this grid", name, k, labels)
                 log.info("%s %s: SynthSeg %s (%d voxels)", name, k, ", ".join(map(str, labels)), int(roi.sum()))
@@ -231,10 +244,28 @@ def bundle_specs_iter(afq, ref_img, transient, names=None, thalamus=None, no_mid
             if labels and r["synthseg_tol_mm"] is not None:            # SynthSeg ends: their own growth
                 k_tol = int(r["synthseg_tol_mm"] / np.mean(np.diag(np.linalg.cholesky(R.T @ R))))
             spec[k] = roi if k_tol <= 0 else distance_transform_edt(~roi) - 0.5 <= k_tol   # pyAFQ's endpoint test
+            edge = r[f"{k}_edge"]
+            if edge:
+                if edge != "inferior":
+                    raise ValueError(f"{name}: {k}_edge must be 'inferior', not {edge!r}")
+                if absorb is None:
+                    raise ValueError(f"{name}: its {k} is the field of view's edge (the {k}_edge rule), "
+                                     "which needs the absorbing classes (absorb=)")
+                spec[k] = inferior_edge_under(spec[k], absorb, transient, ref_img.affine)
+                if spec[k].any():
+                    log.info("%s %s: the field of view's lower edge under it (%d voxels)", name, k,
+                             int(spec[k].sum()))
+                else:
+                    log.warning("%s %s: the field of view has no lower edge under it: no %s", name, k, k)
+        if r["sides"]:
+            m = side_exclusion(synthseg(()), r["sides"], ref_img.affine)
+            exc.append(m)
+            log.info("%s: kept to %s (%d voxels excluded; the brainstem has no side)", name,
+                     ", ".join(f"the {v} {c}" for c, v in r["sides"].items()), int(m.sum()))
         if bd[name].get("cross_midline") is False and name in no_midline:
             log.info("%s: no midline exclusion (no_midline)", name)
         elif bd[name].get("cross_midline") is False:
-            t = r["midline_tol"] if midline_tol is None or not r["midline_tol"] else midline_tol
+            t = r["midline_tol"]
             left = _is_left(name, spec, x)
             exc.append(x > t if left else x < -t)
             log.info("%s: kept to the %s hemisphere (other side excluded past %g mm)", name,
@@ -261,6 +292,96 @@ def _is_left(name, spec, x):
         if c:
             return float(np.mean(c)) < 0
     return True
+
+
+def _down(affine):
+    """(voxel axis, index step) that goes down in world space (-z), most nearly."""
+    R = np.asarray(affine)[:3, :3]
+    a = int(np.argmax(np.abs(R[2])))
+    return a, (-1 if R[2, a] > 0 else 1)
+
+
+def column_under(roi, affine, margin_mm=5.0):
+    """The voxels under ``roi``: in its footprint seen from below (grown ``margin_mm`` across)
+    and below its center.  Empty if ``roi`` is."""
+    from scipy.ndimage import distance_transform_edt
+
+    roi = np.asarray(roi, bool)
+    if not roi.any():
+        return np.zeros_like(roi)
+    a, step = _down(affine)
+    zooms = np.sqrt((np.asarray(affine)[:3, :3] ** 2).sum(0))
+    foot = roi.any(axis=a)
+    foot = distance_transform_edt(~foot, sampling=np.delete(zooms, a)) <= margin_mm
+    pos = np.arange(roi.shape[a]).reshape([-1 if i == a else 1 for i in range(3)])
+    center = np.argwhere(roi)[:, a].mean()
+    return np.expand_dims(foot, a) & ((pos - center) * step >= 0)
+
+
+def inferior_edge_under(roi, absorb, transient, affine, margin_mm=5.0):
+    """Where the field of view's lower edge lies under ``roi`` (column_under): edge voxels
+    (absorbing class 3) whose neighbor below is outside the field.  For an end where a tract
+    leaves the scan at the bottom -- in the brainstem, or the spinal cord under it, which
+    SynthSeg does not label."""
+    field = np.asarray(transient, bool) | (np.asarray(absorb) > 0)
+    a, step = _down(affine)
+    below = np.zeros_like(field)                       # is the neighbor below in the field?
+    src = [slice(None)] * 3
+    dst = [slice(None)] * 3
+    src[a], dst[a] = (slice(1, None), slice(None, -1)) if step == 1 else (slice(None, -1), slice(1, None))
+    below[tuple(dst)] = field[tuple(src)]
+    return (np.asarray(absorb) == 3) & ~below & column_under(roi, affine, margin_mm)
+
+
+SIDES = ("left", "right", "both", "none")
+
+
+def _side_codes():
+    """SynthSeg label -> 0 (no side), 1 / 2 cerebrum left / right, 3 / 4 cerebellum left / right."""
+    from AFQ.nn.synthseg import SynthSegLabels
+
+    lut = np.zeros(max(int(m) for m in SynthSegLabels) + 1, np.int8)
+    for m in SynthSegLabels:
+        n = m.name
+        left = n.startswith("LEFT_") or n.startswith("CTX_LH_")
+        right = n.startswith("RIGHT_") or n.startswith("CTX_RH_")
+        if left or right:
+            lut[int(m)] = (3 if "CEREBELLUM" in n else 1) + (1 if right else 0)
+    return lut
+
+
+def side_exclusion(seg, sides, affine):
+    """Where a bundle kept to ``sides`` ({"cerebrum": side, "cerebellum": side}, each "left",
+    "right", "both" or "none"; missing: "both") may not go.  Every voxel takes the class and
+    side of the nearest SynthSeg label that has them (a cerebral or a cerebellar label, left or
+    right): white matter SynthSeg leaves unlabeled or calls CSF, the third ventricle's walls,
+    the vermis on the midline, all fall to a side.  The brainstem has no side, nor the
+    unlabeled field under it (the cord): those are never excluded."""
+    from scipy.ndimage import distance_transform_edt
+
+    from AFQ.nn.synthseg import SynthSegLabels
+
+    bad = set(sides) - {"cerebrum", "cerebellum"} or {v for v in sides.values() if v not in SIDES}
+    if bad:
+        raise ValueError(f"sides: {sides!r} (keys cerebrum / cerebellum, values {SIDES})")
+    seg = np.asarray(seg)
+    lut = _side_codes()
+    code = lut[np.clip(seg, 0, lut.size - 1)]
+    stem = seg == int(SynthSegLabels.BRAIN_STEM)
+    neutral = stem | (column_under(stem, affine) & (code == 0))
+    if not (code > 0).any():
+        return np.zeros(seg.shape, bool)
+    zooms = np.sqrt((np.asarray(affine)[:3, :3] ** 2).sum(0))
+    near = code[tuple(distance_transform_edt(code == 0, sampling=zooms, return_distances=False,
+                                             return_indices=True))]
+    near[neutral] = 0
+    keep = {"left": (1,), "right": (2,), "both": (1, 2), "none": ()}
+    out = np.zeros(seg.shape, bool)
+    for cls, base in (("cerebrum", 0), ("cerebellum", 2)):
+        allowed = {base + k for k in keep[sides.get(cls, "both")]}
+        for c in {base + 1, base + 2} - allowed:
+            out |= near == c
+    return out
 
 
 CORTEX_PARCELS = range(34, 102)  # SynthSegLabels.CTX_LH_BANKSSTS .. CTX_RH_INSULA (Desikan-Killiany)
@@ -391,15 +512,15 @@ def _thalami_if_synthseg(afq, sh_img, synthseg_thalamus):
     return _subject_thalami(afq, sh_img) if use else None
 
 
-def roi_specs(afq, sh_img, transient, stem, bundles=None, thalamus=None, no_midline=(), midline_tol=None,
-              fornix=True):
+def roi_specs(afq, sh_img, transient, stem, bundles=None, thalamus=None, no_midline=(),
+              fornix=True, absorb=None):
     """bundle_specs_iter, writing each bundle's ROI masks as it goes: start / end, the include
     ROIs (labelled 1, 2, ... in pyAFQ's order) and the exclude ROIs (without the other
     hemisphere, which cross_midline=False bundles exclude too)."""
     for spec in bundle_specs_iter(afq, sh_img, transient, bundles, thalamus=thalamus, no_midline=no_midline,
-                                  midline_tol=midline_tol, fornix=fornix,
+                                  fornix=fornix,
                                   hypo_file=f"{stem}_model-synthseg2hypo_dseg.nii.gz",
-                                  parc_file=parc_file_of(stem)):
+                                  parc_file=parc_file_of(stem), absorb=absorb):
         b = f"{stem}_bundle-{re.sub(r'[^A-Za-z0-9]', '', spec['name'])}"
         save = lambda m, desc: nib.save(nib.Nifti1Image(np.asarray(m, np.uint8), sh_img.affine),  # noqa: E731
                                         f"{b}_desc-{desc}_mask.nii.gz")
@@ -418,15 +539,17 @@ def roi_specs(afq, sh_img, transient, stem, bundles=None, thalamus=None, no_midl
 
 
 def write_rois(afq, bundles=None, moments=False, synthseg_thalamus=True, no_midline=(), page=True,
-               midline_tol=None, out_dir=None, fornix=True):
-    """Write the ROI masks of a finished run's bundles (start / end / include / exclude) without
-    solving anything, and a viewer page showing them (bundles with no streamlines included).
-    Returns the page's path (or None)."""
+               out_dir=None, fornix=True):
+    """Write the ROI masks of a finished run's bundles (start / end / include / exclude) again
+    without solving anything, and a viewer page showing them (bundles with no streamlines
+    included).  Python only: every run already writes the masks, and its viewer pages show
+    the include / exclude ROIs.  Returns the page's path (or None)."""
     from .core import bundle_files
     from .viewer import save_html
 
     sh_img = nib.load(afq.export(f"{afq.export('tracking_params')['odf_model'].lower()}_params"))
-    transient, _, _ = tissue_labels(sh_img, nib.load(afq.export("pve_internal")), nib.load(afq.export("brain_mask")))
+    transient, absorb, _ = tissue_labels(sh_img, nib.load(afq.export("pve_internal")),
+                                         nib.load(afq.export("brain_mask")))
     out = mpat_dir(afq, moments, out_dir)
     stem = str(out / Path(afq.kwargs["base_fname"]).name)
     done = bundle_files(out)
@@ -436,7 +559,8 @@ def write_rois(afq, bundles=None, moments=False, synthseg_thalamus=True, no_midl
         log.warning("no run outputs for %s: their ROIs are not written",
                     [n for n in names if n not in run_names])
     thal = _thalami_if_synthseg(afq, sh_img, synthseg_thalamus)
-    for spec in roi_specs(afq, sh_img, transient, stem, run_names, thal, no_midline, midline_tol, fornix):
+    for spec in roi_specs(afq, sh_img, transient, stem, run_names, thal, no_midline, fornix,
+                          absorb=absorb):
         log.info("%s: ROI masks written", spec["name"])
     if not page or not run_names:
         return None
@@ -444,10 +568,10 @@ def write_rois(afq, bundles=None, moments=False, synthseg_thalamus=True, no_midl
                      bundles=[re.sub(r"[^A-Za-z0-9]", "", n) for n in run_names], rois=True)
 
 
-def visualize(out, stem, bundles, fodf=None, t1=None, rois=False):
+def visualize(out, stem, bundles, fodf=None, t1=None, rois=True):
     """The run's figures: a MIP collage of the bundles, a viewer page with all of them
     (densities and cores), and a page per bundle with its glyphs (and the fODF, if given);
-    ``rois``: the pages also show each bundle's include / exclude ROIs.
+    ``rois`` (default): the pages also show each bundle's include (green) / exclude (red) ROIs.
     Failures are logged, not raised: the bundles are already on disk."""
     from .collage import write_collage
     from .core import bundle_files
@@ -466,6 +590,45 @@ def visualize(out, stem, bundles, fodf=None, t1=None, rois=False):
             log.info("%s: %s", what, job())
         except Exception as err:  # noqa: BLE001
             log.warning("%s not written: %s", what, err)
+
+
+def _bridge(chain, gm, sh_img, stem, tol, cfg, max_length, verbose=False):
+    """End-launched streamlines with uniform gray-matter ends (mpat.solve.end_bridge) for the
+    geometry target, from <stem>_desc-bridge_cache.npz when it was made for the same chain,
+    tolerance and soft maximum length; written as maps and <stem>_desc-bridge.json.
+    Returns (EndLaunches, arrival factor per absorbing voxel)."""
+    zooms = sh_img.header.get_zooms()[:3]
+    target = geometry_target(chain, gm, zooms)
+    key = json.dumps(dict(chain=cfg.key(), tol=tol, bridge_tol=BRIDGE_TOL, max_length=max_length,
+                          absorbing=int(chain.a_lin.size), target=round(float(target.sum()), 3),
+                          method="end-launched"), sort_keys=True)
+    cache = f"{stem}_desc-bridge_cache.npz"
+    E = None
+    if os.path.exists(cache):
+        z = np.load(cache, allow_pickle=False)
+        if "key" in z and str(z["key"]) == key:
+            E, g, info = end_launches(chain, z["sites"], z["f"]), z["g"], json.loads(str(z["info"]))
+            log.info("Schrödinger bridge: from %s", cache)
+    if E is None:
+        E, g, info = end_bridge(chain, target, tol=tol, verbose=verbose)
+        np.savez(cache, key=key, sites=E.sites, f=E.w, g=g, info=json.dumps(info))
+    f = np.zeros(chain.a_lin.size)
+    f[E.sites] = E.w
+    for desc, vals in (("bridgelaunch", f), ("bridgearrival", g), ("bridgetarget", target)):
+        nib.save(nib.Nifti1Image(chain.to_volume(vals, "absorbing"), sh_img.affine), f"{stem}_desc-{desc}_map.nii.gz")
+    with open(f"{stem}_desc-bridge.json", "w") as fh:
+        json.dump(dict(method="end-launched streamlines, Schrödinger bridge to uniform gray-matter ends "
+                              "(mpat.solve.end_bridge)",
+                       target="gray-matter volume behind each gray-matter end voxel (geometry_target): one "
+                              "streamline end per mm^3",
+                       bridgelaunch="expected streamlines launched from each gray-matter end voxel (f)",
+                       bridgearrival="the factor a streamline arriving in the voxel is weighted by (g)",
+                       bridgetarget="the target, mm^3 of gray matter", **info), fh, indent=1)
+    log.info("Schrödinger bridge: %d rounds, arrivals %.1e from the target, arrival factors %.2g..%.2g "
+             "(median %.2g), %.0f streamlines", info["rounds"], info["arrivals_l1_from_target"],
+             info["arrival_factor_min"], info["arrival_factor_max"], info["arrival_factor_median"],
+             info["streamlines"])
+    return E, g
 
 
 def mpat_dir(afq, moments=False, out_dir=None):
@@ -564,8 +727,8 @@ def _bytes(x):
 
 
 def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angle=35.0, double_odf=True,
-        cores=True, viz=True, synthseg_thalamus=True, max_length=250.0, viz_rois=False,
-        no_midline=(), midline_tol=None, out_dir=None, verbose=False, fornix=True):
+        cores=True, viz=True, synthseg_thalamus=True, max_length=250.0,
+        no_midline=(), out_dir=None, verbose=False, fornix=True, schrodinger=False):
     """Segment pyAFQ's bundles with MPAT.
 
     afq         ``ParticipantAFQ`` or ``GroupAFQ`` (every participant in turn)
@@ -583,11 +746,7 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
     viz         also write a MIP collage of all bundles (PNG), a viewer page of all bundles
                 (densities and cores), and one page per bundle with its visitation-ODF glyphs
                 and the fODF (mpat.viewer.save_html).  Pages load NiiVue from a CDN.
-    viz_rois    the viewer pages also show each bundle's include / exclude ROIs
     no_midline  bundle names whose cross_midline=False is ignored (no other-hemisphere exclusion)
-    midline_tol mm past the midline the corticospinal tracts may go before the other hemisphere
-                is excluded (default: their rule, 10; 0: a strict cut); every other one-sided bundle
-                follows its own rule (mpat.bundles; default a strict cut at x = 0)
     max_length  soft maximum streamline length (mm; 0: none).  Before any bundle is solved,
                 direction states from which most walkers would still be walking after this
                 long -- traps where they circle, unable to turn out under the angle limit --
@@ -601,13 +760,23 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
                 sum); the time per stage is logged at the end anyway
     synthseg_thalamus  with pyAFQ's SynthSeg tissue (pve unset or "synthseg"), a template start / end
                 ROI that is the thalamus is replaced by SynthSeg's thalamus (see bundle_specs)
+    schrodinger streamlines are launched from gray matter instead of white-matter seeds
+                (mpat.solve.end_bridge): each a walk from a gray-matter end voxel into white
+                matter (the reverse of how walkers arrive there), weighted per launch voxel and
+                per arrival voxel, once per subject before any bundle, so that every gray-matter
+                end voxel launches half and receives half of its target, the gray-matter volume
+                behind it (geometry_target): one streamline end per mm^3 of gray matter, exactly.
+                Paths keep their transition probabilities.  Not with moments.  The weights are
+                cached (<stem>_desc-bridge_cache.npz) and written as maps (<stem>_desc-bridgelaunch,
+                _desc-bridgearrival, _desc-bridgetarget _map) with <stem>_desc-bridge.json; each
+                bundle's seed map becomes _desc-launches_map
     Returns {bundle: BundleResult} (a dict per participant for a GroupAFQ)."""
     import numba
 
     if hasattr(afq, "pAFQ_list"):
         kw = dict(cores=cores, viz=viz, synthseg_thalamus=synthseg_thalamus, max_length=max_length,
-                  viz_rois=viz_rois, no_midline=no_midline, midline_tol=midline_tol,
-                  verbose=verbose, fornix=fornix)
+                  no_midline=no_midline,
+                  verbose=verbose, fornix=fornix, schrodinger=schrodinger)
         return {f"sub-{s}_ses-{t}": run(p, n_proc, max_mem, bundles, moments, tol, angle, double_odf, **kw,
                                         out_dir=out_dir and str(Path(out_dir) / f"sub-{s}" / f"ses-{t}"))
                 for s, t, p in zip(afq.valid_sub_list, afq.valid_ses_list, afq.pAFQ_list)}
@@ -631,7 +800,8 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
     def specs():
         # each bundle's ROIs warped just before its group is solved, its ROI masks written then
         # (the solve keeps what it needs, so the ROIs can go)
-        yield from roi_specs(afq, sh_img, transient, stem, bundles, thal, no_midline, midline_tol, fornix)
+        yield from roi_specs(afq, sh_img, transient, stem, bundles, thal, no_midline, fornix,
+                             absorb=absorb)
 
     cfg = ChainConfig(angle=angle, double_odf=double_odf, moments=moments)
     with clock("fODF load"):
@@ -652,9 +822,15 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
                  "keep most walkers longer than that and end them invalidly (%.0fs)", max_length, T,
                  kill.sum(), kill.size, int(kill.reshape(-1, chain.nb).any(1).sum()), time.time() - t1_)
     clock.add("soft max length", time.perf_counter() - t_ol)
-    with clock("seed launches (prepare)"):
-        launches = prepare_launches(chain, seeds)
-    chain.release_pmfs()
+    end_weights = None
+    if schrodinger:              # streamlines launched from gray matter, uniform ends: no white-matter seeds
+        chain.release_pmfs()
+        with clock("Schrödinger bridge"):
+            launches, end_weights = _bridge(chain, dseg == 2, sh_img, stem, tol, cfg, max_length, verbose)
+    else:
+        with clock("seed launches (prepare)"):
+            launches = prepare_launches(chain, seeds)
+        chain.release_pmfs()
     rows = []
 
     def write(res):
@@ -662,7 +838,8 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
         b = f"{stem}_bundle-{name}"
         sp = np.zeros(chain.shape, np.float32)
         np.add.at(sp, tuple(res.seed_vox.T), res.seed_prob)
-        maps = dict(seedprob=(sp, "probmap"), density=(chain.to_volume(res.density_t), "map"),
+        maps = dict(**({"launches": (sp, "map")} if schrodinger else {"seedprob": (sp, "probmap")}),
+                    density=(chain.to_volume(res.density_t), "map"),
                     endpoints=(chain.to_volume(res.endpoints_a, "absorbing"), "map"))
         d = res.density_t
         keep = np.flatnonzero(d >= ODF_FLOOR * d.max()) if d.max() > 0 else np.zeros(0, np.int64)
@@ -675,12 +852,17 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
             nib.save(nib.Nifti1Image(vol, sh_img.affine), f"{b}_desc-{desc}_{suffix}.nii.gz")
         with open(f"{b}_desc-summary.json", "w") as fh:
             json.dump(dict(bundle=res.name, config=cfg.key(), result=res.info,
+                           streamlines="launched from gray matter, Schrödinger bridge to uniform gray-matter "
+                                       "ends (<stem>_desc-bridge.json)" if schrodinger else
+                                       "white-matter seeds (pyAFQ's seed mask), a pair of half-walks each",
                            valid_ends=[ABSORB_CLASSES[c] for c in (1, 3)],
                            density="expected steps of bundle streamlines in each voxel, all seeds",
                            endpoints="expected bundle endpoints per voxel (two per streamline)",
                            visitodf="the walkers' directions per voxel: SH (descoteaux07, legacy, "
                                     "lmax 8), expected visits per steradian",
-                           seedprob="P(the streamline seeded here belongs to the bundle)"), fh, indent=1)
+                           **({"launches": "expected bundle streamlines launched from each gray-matter end "
+                                           "voxel"} if schrodinger else
+                              {"seedprob": "P(the streamline seeded here belongs to the bundle)"})), fh, indent=1)
         i = res.info
         rows.append(dict(bundle=res.name, expected_streamlines=round(i["expected_bundle_streamlines"], 4),
                          columns=i["n_columns"], backward_steps=i["backward"]["iterations"],
@@ -700,8 +882,8 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
                     "most of it at (%.0f, %.0f, %.0f) mm", what, ", ".join(names), vol.sum(), f, *peak)
 
     results = segment_bundles(chain, specs(), launches, tol=tol, max_mem=_budget(max_mem, chain, launches),
-                              on_result=write,
-                               on_trapped=trapped, verbose=verbose, clock=clock)
+                              on_result=write, on_trapped=trapped, verbose=verbose, clock=clock,
+                              end_weights=end_weights)
     with open(f"{stem}_desc-mpat_table.tsv", "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=list(rows[0]), delimiter="\t")
         w.writeheader()
@@ -716,7 +898,7 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
             t1 = afq.export("t1_masked")
         except Exception:  # noqa: BLE001 -- the collage falls back to the tissue labels
             t1 = None
-        visualize(out, stem, [re.sub(r"[^A-Za-z0-9]", "", n) for n in results], sh_path, t1=t1, rois=viz_rois)
+        visualize(out, stem, [re.sub(r"[^A-Za-z0-9]", "", n) for n in results], sh_path, t1=t1)
         clock.add("viz", time.perf_counter() - t_viz)
     clock.report("MPAT time per stage", time.time() - t0)
     log.info("MPAT: %d bundles in %.0fs -> %s", len(results), time.time() - t0, out)
