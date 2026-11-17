@@ -53,12 +53,6 @@ def main(argv=None):
                         "and superior peduncles of each side, from template waypoints, the middle and superior "
                         "crossing only in the brainstem; 6 bundles, also given to "
                         "pyAFQ with --pyafq)")
-    p.add_argument("--schrodinger", action="store_true",
-                   help="launch streamlines from gray matter instead of white-matter seeds, weighted so that "
-                        "every gray-matter end voxel launches half and receives half of the gray-matter volume "
-                        "behind it: one streamline end per mm^3 of gray matter, exactly (a Schrödinger bridge; "
-                        "paths keep their transition probabilities; mpat.solve.end_bridge, cached per subject; "
-                        "not with --moments)")
     p.add_argument("--pyafq", action="store_true",
                    help="also run pyAFQ's own pipeline (tractography, segmentation, profiles; export_all) "
                         "on the same ParticipantAFQ, for comparison: same inputs, kwargs and derivatives")
@@ -96,7 +90,7 @@ def main(argv=None):
         synthseg_thalamus=not a.mni_thalamus,
         max_length=a.max_length, no_midline=a.no_midline,
         out_dir=a.out_dir, verbose=a.verbose,
-        fornix=not a.no_fornix_exclude, schrodinger=a.schrodinger)
+        fornix=not a.no_fornix_exclude)
     if a.pyafq:   # pyAFQ's recognition: MPAT's rules removed, MPAT-only bundles (fornix) dropped
         from .bundles import pyafq_bd
 

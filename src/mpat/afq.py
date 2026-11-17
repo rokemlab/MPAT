@@ -20,8 +20,7 @@ import numpy as np
 
 from .chain import ABSORB_CLASSES, Chain, ChainConfig
 from .geometry import visitation_odf
-from .solve import (BRIDGE_TOL, Clock, end_bridge, end_launches, geometry_target, overlength_states,
-                    prepare_launches, segment_bundles)
+from .solve import Clock, overlength_states, prepare_launches, segment_bundles
 
 log = logging.getLogger("mpat")
 WM_THRESHOLD = 0.4   # pyAFQ's tracker stops where WM PVE <= gm_threshold (0.4)
@@ -592,45 +591,6 @@ def visualize(out, stem, bundles, fodf=None, t1=None, rois=True):
             log.warning("%s not written: %s", what, err)
 
 
-def _bridge(chain, gm, sh_img, stem, tol, cfg, max_length, verbose=False):
-    """End-launched streamlines with uniform gray-matter ends (mpat.solve.end_bridge) for the
-    geometry target, from <stem>_desc-bridge_cache.npz when it was made for the same chain,
-    tolerance and soft maximum length; written as maps and <stem>_desc-bridge.json.
-    Returns (EndLaunches, arrival factor per absorbing voxel)."""
-    zooms = sh_img.header.get_zooms()[:3]
-    target = geometry_target(chain, gm, zooms)
-    key = json.dumps(dict(chain=cfg.key(), tol=tol, bridge_tol=BRIDGE_TOL, max_length=max_length,
-                          absorbing=int(chain.a_lin.size), target=round(float(target.sum()), 3),
-                          method="end-launched"), sort_keys=True)
-    cache = f"{stem}_desc-bridge_cache.npz"
-    E = None
-    if os.path.exists(cache):
-        z = np.load(cache, allow_pickle=False)
-        if "key" in z and str(z["key"]) == key:
-            E, g, info = end_launches(chain, z["sites"], z["f"]), z["g"], json.loads(str(z["info"]))
-            log.info("Schrödinger bridge: from %s", cache)
-    if E is None:
-        E, g, info = end_bridge(chain, target, tol=tol, verbose=verbose)
-        np.savez(cache, key=key, sites=E.sites, f=E.w, g=g, info=json.dumps(info))
-    f = np.zeros(chain.a_lin.size)
-    f[E.sites] = E.w
-    for desc, vals in (("bridgelaunch", f), ("bridgearrival", g), ("bridgetarget", target)):
-        nib.save(nib.Nifti1Image(chain.to_volume(vals, "absorbing"), sh_img.affine), f"{stem}_desc-{desc}_map.nii.gz")
-    with open(f"{stem}_desc-bridge.json", "w") as fh:
-        json.dump(dict(method="end-launched streamlines, Schrödinger bridge to uniform gray-matter ends "
-                              "(mpat.solve.end_bridge)",
-                       target="gray-matter volume behind each gray-matter end voxel (geometry_target): one "
-                              "streamline end per mm^3",
-                       bridgelaunch="expected streamlines launched from each gray-matter end voxel (f)",
-                       bridgearrival="the factor a streamline arriving in the voxel is weighted by (g)",
-                       bridgetarget="the target, mm^3 of gray matter", **info), fh, indent=1)
-    log.info("Schrödinger bridge: %d rounds, arrivals %.1e from the target, arrival factors %.2g..%.2g "
-             "(median %.2g), %.0f streamlines", info["rounds"], info["arrivals_l1_from_target"],
-             info["arrival_factor_min"], info["arrival_factor_max"], info["arrival_factor_median"],
-             info["streamlines"])
-    return E, g
-
-
 def mpat_dir(afq, moments=False, out_dir=None):
     """Where MPAT's outputs go: ``out_dir`` if given, else <pyAFQ output_dir>/mpat (mpat-moments)."""
     if out_dir:
@@ -728,7 +688,7 @@ def _bytes(x):
 
 def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angle=35.0, double_odf=True,
         cores=True, viz=True, synthseg_thalamus=True, max_length=250.0,
-        no_midline=(), out_dir=None, verbose=False, fornix=True, schrodinger=False):
+        no_midline=(), out_dir=None, verbose=False, fornix=True):
     """Segment pyAFQ's bundles with MPAT.
 
     afq         ``ParticipantAFQ`` or ``GroupAFQ`` (every participant in turn)
@@ -760,23 +720,13 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
                 sum); the time per stage is logged at the end anyway
     synthseg_thalamus  with pyAFQ's SynthSeg tissue (pve unset or "synthseg"), a template start / end
                 ROI that is the thalamus is replaced by SynthSeg's thalamus (see bundle_specs)
-    schrodinger streamlines are launched from gray matter instead of white-matter seeds
-                (mpat.solve.end_bridge): each a walk from a gray-matter end voxel into white
-                matter (the reverse of how walkers arrive there), weighted per launch voxel and
-                per arrival voxel, once per subject before any bundle, so that every gray-matter
-                end voxel launches half and receives half of its target, the gray-matter volume
-                behind it (geometry_target): one streamline end per mm^3 of gray matter, exactly.
-                Paths keep their transition probabilities.  Not with moments.  The weights are
-                cached (<stem>_desc-bridge_cache.npz) and written as maps (<stem>_desc-bridgelaunch,
-                _desc-bridgearrival, _desc-bridgetarget _map) with <stem>_desc-bridge.json; each
-                bundle's seed map becomes _desc-launches_map
     Returns {bundle: BundleResult} (a dict per participant for a GroupAFQ)."""
     import numba
 
     if hasattr(afq, "pAFQ_list"):
         kw = dict(cores=cores, viz=viz, synthseg_thalamus=synthseg_thalamus, max_length=max_length,
                   no_midline=no_midline,
-                  verbose=verbose, fornix=fornix, schrodinger=schrodinger)
+                  verbose=verbose, fornix=fornix)
         return {f"sub-{s}_ses-{t}": run(p, n_proc, max_mem, bundles, moments, tol, angle, double_odf, **kw,
                                         out_dir=out_dir and str(Path(out_dir) / f"sub-{s}" / f"ses-{t}"))
                 for s, t, p in zip(afq.valid_sub_list, afq.valid_ses_list, afq.pAFQ_list)}
@@ -822,15 +772,9 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
                  "keep most walkers longer than that and end them invalidly (%.0fs)", max_length, T,
                  kill.sum(), kill.size, int(kill.reshape(-1, chain.nb).any(1).sum()), time.time() - t1_)
     clock.add("soft max length", time.perf_counter() - t_ol)
-    end_weights = None
-    if schrodinger:              # streamlines launched from gray matter, uniform ends: no white-matter seeds
-        chain.release_pmfs()
-        with clock("Schrödinger bridge"):
-            launches, end_weights = _bridge(chain, dseg == 2, sh_img, stem, tol, cfg, max_length, verbose)
-    else:
-        with clock("seed launches (prepare)"):
-            launches = prepare_launches(chain, seeds)
-        chain.release_pmfs()
+    with clock("seed launches (prepare)"):
+        launches = prepare_launches(chain, seeds)
+    chain.release_pmfs()
     rows = []
 
     def write(res):
@@ -838,8 +782,7 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
         b = f"{stem}_bundle-{name}"
         sp = np.zeros(chain.shape, np.float32)
         np.add.at(sp, tuple(res.seed_vox.T), res.seed_prob)
-        maps = dict(**({"launches": (sp, "map")} if schrodinger else {"seedprob": (sp, "probmap")}),
-                    density=(chain.to_volume(res.density_t), "map"),
+        maps = dict(seedprob=(sp, "probmap"), density=(chain.to_volume(res.density_t), "map"),
                     endpoints=(chain.to_volume(res.endpoints_a, "absorbing"), "map"))
         d = res.density_t
         keep = np.flatnonzero(d >= ODF_FLOOR * d.max()) if d.max() > 0 else np.zeros(0, np.int64)
@@ -852,17 +795,12 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
             nib.save(nib.Nifti1Image(vol, sh_img.affine), f"{b}_desc-{desc}_{suffix}.nii.gz")
         with open(f"{b}_desc-summary.json", "w") as fh:
             json.dump(dict(bundle=res.name, config=cfg.key(), result=res.info,
-                           streamlines="launched from gray matter, Schrödinger bridge to uniform gray-matter "
-                                       "ends (<stem>_desc-bridge.json)" if schrodinger else
-                                       "white-matter seeds (pyAFQ's seed mask), a pair of half-walks each",
                            valid_ends=[ABSORB_CLASSES[c] for c in (1, 3)],
                            density="expected steps of bundle streamlines in each voxel, all seeds",
                            endpoints="expected bundle endpoints per voxel (two per streamline)",
                            visitodf="the walkers' directions per voxel: SH (descoteaux07, legacy, "
                                     "lmax 8), expected visits per steradian",
-                           **({"launches": "expected bundle streamlines launched from each gray-matter end "
-                                           "voxel"} if schrodinger else
-                              {"seedprob": "P(the streamline seeded here belongs to the bundle)"})), fh, indent=1)
+                           seedprob="P(the streamline seeded here belongs to the bundle)"), fh, indent=1)
         i = res.info
         rows.append(dict(bundle=res.name, expected_streamlines=round(i["expected_bundle_streamlines"], 4),
                          columns=i["n_columns"], backward_steps=i["backward"]["iterations"],
@@ -882,8 +820,8 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
                     "most of it at (%.0f, %.0f, %.0f) mm", what, ", ".join(names), vol.sum(), f, *peak)
 
     results = segment_bundles(chain, specs(), launches, tol=tol, max_mem=_budget(max_mem, chain, launches),
-                              on_result=write, on_trapped=trapped, verbose=verbose, clock=clock,
-                              end_weights=end_weights)
+                              on_result=write,
+                               on_trapped=trapped, verbose=verbose, clock=clock)
     with open(f"{stem}_desc-mpat_table.tsv", "w", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=list(rows[0]), delimiter="\t")
         w.writeheader()

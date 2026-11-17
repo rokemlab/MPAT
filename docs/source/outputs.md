@@ -15,11 +15,6 @@ pyAFQ's own outputs.
 | `<sub>_desc-mpat_table.tsv` | per bundle: expected streamlines, columns, steps, Krylov products, time |
 | `<sub>_desc-mpat_dseg.nii.gz` | the tissue labels used: 1 WM, 2 GM, 3 CSF, 4 brain edge |
 | `<sub>_desc-chain_cache.npz` | the transition matrix, reused when the inputs and settings match |
-| `..._desc-launches_map.nii.gz` | with `--schrodinger`, in place of the seed map: expected bundle streamlines launched from each gray-matter end voxel |
-| `<sub>_desc-bridgelaunch_map.nii.gz` | with `--schrodinger`: expected streamlines launched from each gray-matter end voxel ($f$, {ref}`bridge`) |
-| `<sub>_desc-bridgearrival_map.nii.gz` | with `--schrodinger`: the factor a streamline arriving in each end voxel is weighted by ($g$) |
-| `<sub>_desc-bridgetarget_map.nii.gz` | with `--schrodinger`: the target, mm³ of gray matter behind each end voxel |
-| `<sub>_desc-bridge.json`, `_desc-bridge_cache.npz` | with `--schrodinger`: rounds, distance from the target, weight ranges, streamlines; the cached weights |
 
 ## Reading the summary
 
