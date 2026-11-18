@@ -648,7 +648,8 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
         no_midline=(), midline_tol=None, out_dir=None, verbose=False, fornix=True, flux=False,
         fixels=False, viz_colormap=None, ptt=False, step=1.0, stop_mass=None, fod_thresh=None,
         fod_power=None, curv_sigma=None, probe_radius=None, sift2=False, arbor=False,
-        arbor_branches=5, save_transitions=False):
+        arbor_branches=5, save_transitions=False, live=None, gpu=None, gpu_weights="float64",
+        gpu_backend="warp"):
     """Segment pyAFQ's bundles with MPAT.
 
     afq         ``ParticipantAFQ`` or ``GroupAFQ`` (every participant in turn)
@@ -685,6 +686,18 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
                 (FORNIX_BOX_MNI; False: as pyAFQ defines them)
     verbose     log timing inside the solves (ms per power step: matrix product / mask and
                 sum); the time per stage is logged at the end anyway
+    live        show the bundles in 3-D as they are solved, on a web page this process serves
+                (mpat.live): True (port 8765, or the next free one), a port number, or a
+                ``mpat.live.LiveView``.  The backward and forward solves of each group are then
+                advanced together (mpat.solve.Interleaved), so a bundle is drawn from the first
+                steps and fills in; the results are the same to the tolerance
+    gpu         run the solves on a GPU (mpat.gpu): True for the first CUDA device, or a device
+                name ("cuda:1"; with Warp, "cpu" runs the GPU code on Warp's CPU device, for
+                testing).  The chain is still built on the host
+    gpu_backend "warp" (default; NVIDIA Warp, pip install warp-lang) or "numba-cuda"
+                (pip install "numba-cuda[cu13]"): the same kernels, two compilers
+    gpu_weights "float64" (default) or "float32": the transition probabilities on the GPU
+                (float32 nearly halves the chain there; densities then agree to about 1e-5)
     synthseg_thalamus  with pyAFQ's SynthSeg tissue (pve unset or "synthseg"), a template start / end
                 ROI that is the thalamus is replaced by SynthSeg's thalamus (see bundle_specs)
     flux        also write each bundle's edge flux (mpat.fields): the expected streamline steps
@@ -725,7 +738,8 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
                   verbose=verbose, fornix=fornix, flux=flux, fixels=fixels, viz_colormap=viz_colormap,
                   ptt=ptt, step=step, stop_mass=stop_mass, fod_thresh=fod_thresh, fod_power=fod_power,
                   curv_sigma=curv_sigma, probe_radius=probe_radius, sift2=sift2, arbor=arbor,
-                  arbor_branches=arbor_branches, save_transitions=save_transitions)
+                  arbor_branches=arbor_branches, save_transitions=save_transitions, live=live, gpu=gpu,
+                  gpu_weights=gpu_weights, gpu_backend=gpu_backend)
         return {f"sub-{s}_ses-{t}": run(p, n_proc, max_mem, bundles, moments, tol, angle, double_odf, **kw,
                                         out_dir=out_dir and str(Path(out_dir) / f"sub-{s}" / f"ses-{t}"))
                 for s, t, p in zip(afq.valid_sub_list, afq.valid_ses_list, afq.pAFQ_list)}
@@ -769,11 +783,18 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
                             cache=f"{stem}_desc-chain_cache.npz")
     with clock("pyAFQ inputs"):
         seeds = np.argwhere((_on_grid(nib.load(afq.export("wm_gm_interface")), sh_img, 0) > 0) & transient)
+    ops = None
+    if gpu:
+        from .gpu import DeviceOps
+
+        with clock("chain to the GPU"):
+            ops = DeviceOps(chain, device=None if gpu is True else gpu, weight_dtype=gpu_weights,
+                            backend=gpu_backend)
     t_ol = time.perf_counter()
     surv_state = None
     if max_length and max_length > 0:
         t1_ = time.time()
-        kill, surv, T = overlength_states(chain, max_length, sh_img.header.get_zooms()[:3])
+        kill, surv, T = overlength_states(chain, max_length, sh_img.header.get_zooms()[:3], ops=ops)
         surv_state = surv
         vox = surv.reshape(-1, chain.nb)
         nib.save(nib.Nifti1Image(chain.to_volume(vox.max(1)), sh_img.affine), f"{stem}_desc-overlength_map.nii.gz")
@@ -785,6 +806,8 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
     with clock("seed launches (prepare)"):
         launches = prepare_launches(chain, seeds)
     chain.release_pmfs()
+    if ops is not None:
+        ops.L = launches
     rows = []
 
     n_trapped = [0]
@@ -818,7 +841,7 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
                 s2_info["final_fit"]["pearson_r"],
             )
         whole = segment_bundles(chain, [dict(name="whole brain")], launches, tol=tol, max_mem=budget,
-                                on_trapped=trapped)["whole brain"]
+                                on_trapped=trapped, ops=ops)["whole brain"]
 
     if save_transitions:
         st_mode = "odx" if save_transitions is True else str(save_transitions).strip().lower()
@@ -907,8 +930,27 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
         rows.append(row)
         log.info("%s: %.2f expected streamlines", res.name, i["expected_bundle_streamlines"])
 
-    results = segment_bundles(chain, specs(), launches, tol=tol, max_mem=budget, on_result=write,
-                              on_trapped=trapped, verbose=verbose, clock=clock, keep_fields=flux)
+    view = None
+    if live:
+        from .live import LiveView
+
+        view = live if isinstance(live, LiveView) else LiveView(
+            chain.shape, sh_img.affine, port=8765 if live is True else int(live), title=Path(stem).name)
+        log.info("live view: open %s in a browser (from another machine, first: "
+                 "ssh -L %d:localhost:%d <this machine>)", view.url, view.port, view.port)
+    try:
+        results = segment_bundles(chain, specs(), launches, tol=tol, max_mem=budget, on_result=write,
+                                  on_trapped=trapped, verbose=verbose, clock=clock, keep_fields=flux,
+                                  on_progress=view.update if view is not None else None, ops=ops)
+    except BaseException:
+        if view is not None and view is not live:
+            view.close(0)
+        raise
+    finally:
+        if ops is not None:
+            ops.release()           # the GPU's memory, before the outputs and the next participant
+    if view is not None:
+        view.finish()
     if fixels:
         with clock("fixels"):
             write_fixels(chain, sh, results, launches, f"{stem}_desc-mpat_fixels", sh_img.affine, tol, budget,
@@ -936,4 +978,6 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
         clock.add("viz", time.perf_counter() - t_viz)
     clock.report("MPAT time per stage", time.time() - t0)
     log.info("MPAT: %d bundles in %.0fs -> %s", len(results), time.time() - t0, out)
+    if view is not None and view is not live:
+        view.close()        # after a moment, so that open pages get the last frame
     return results

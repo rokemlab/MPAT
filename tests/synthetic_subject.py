@@ -84,17 +84,18 @@ def make_subject(root, shape=(22, 22, 10), vox=2.0, seed=0):
     return files
 
 
-def make_afq(files, out):
+def make_afq(files, out, space="subject"):
     """A pyAFQ ParticipantAFQ that runs offline: given PVE and brain mask, identity mapping,
-    the T1 as registration template, subject-space bundles, symmetric CSD (fast)."""
+    the T1 as registration template, subject-space bundles (``space="template"``: the same ROIs
+    as template ROIs, so pyAFQ warps them, through the identity), symmetric CSD (fast)."""
     from AFQ.api.bundle_dict import BundleDict
     from AFQ.api.participant import ParticipantAFQ
     from AFQ.definitions.image import ImageFile, PVEImages
     from AFQ.definitions.mapping import IdentityMap
 
     Path(out).mkdir(parents=True, exist_ok=True)
-    bd = BundleDict({k: dict(v, space="subject", cross_midline=None) for k, v in files["rois"].items()},
-                    resample_to=nib.load(files["t1"]), resample_subject_to=True)
+    bd = BundleDict({k: dict(v, space=space, cross_midline=None) for k, v in files["rois"].items()},
+                    resample_to=nib.load(files["t1"]), resample_subject_to=space == "subject")
     return ParticipantAFQ(files["dwi"], files["bval"], files["bvec"], files["t1"], str(out),
                           brain_mask_definition=ImageFile(path=files["mask"]),
                           # PVEImages, not PVEImage(path=...): the latter raises in pyAFQ 3.4

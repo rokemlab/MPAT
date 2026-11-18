@@ -50,6 +50,11 @@ MITTENS v2 (`mittens-dmri`) is not on PyPI yet, so pip builds it from GitHub wit
 | `viz` | `--no-viz` | on | the collage and viewer pages below |
 | `viz_colormap` | `--colormap` | actc | NiiVue colour map of the density on every viewer page, e.g. `turbo`, `hot`, `cubehelix`; `bundle` gives one hue per bundle |
 | `mpat.afq.write_viz` | `--viz-only` | | solve nothing: rewrite a finished run's collage and viewer pages (e.g. after updating mpat); same arguments as the run, `--n-proc` not needed |
+| `live` | `--live` | off | draw each bundle in 3-D in a browser while it is solved; the page's address is logged (`mpat.live`) |
+| `gpu` | `--gpu` | off | run the solves on an NVIDIA GPU with [Warp](https://github.com/NVIDIA/warp) (`pip install warp-lang`; `mpat.gpu`) |
+| `gpu_weights` | `--gpu-weights` | `float64` | `float32` nearly halves the chain on the GPU; densities then agree to about 1e-5 |
+| `gpu_backend` | `--gpu-backend` | `warp` | the GPU code's compiler: `warp` or `numba-cuda` (`pip install "numba-cuda[cu13]"`; `--gpu-backend numba`) |
+| `mpat.transport.run` | `--transport` | off | the bundles as linear transport instead of the chain: walkers run straight in any of a sphere's directions and turn by the fODF, solved on a GPU with Warp (`mpat.transport`); `--transport-mfp` (mean straight run between turns, default 2 mm) and `--transport-sphere` (default `symmetric362`); outputs in `<output_dir>/mpat-transport/` |
 
 Any pyAFQ setting goes on the `ParticipantAFQ`; with the CLI, pass it as `--afq-kwargs`. That covers the fODF model (`tracking_params={"odf_model": ...}`), the PVE, custom bundle dictionaries including subject-space ROIs, and `segmentation_params={"dist_to_atlas": ...}`. `--afq-kwargs` takes JSON, or a Python expression that gives a dict, for settings that are Python objects. The expression sees `afd` (`AFQ.data.fetch`), `abd` (`AFQ.api.bundle_dict`), the `AFQ.definitions` image and mapping classes, `np` and `nib`. For example, an infant run:
 

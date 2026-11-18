@@ -720,6 +720,41 @@ def _extrapolate_accumulate(term, nxt, total, omega, ncomp):
 
 
 @njit(parallel=True, cache=True)
+def step_source(nxt, mask, src, cur, ncomp):
+    """One fixed-point step x <- src + M A x, given nxt = A cur: nxt = src + mask * nxt.
+    Returns per column sum |nxt - cur| over the mass rows (what the step added)."""
+    R, C = nxt.shape
+    nblk = 512
+    bs = (R + nblk - 1) // nblk
+    part = np.zeros((nblk, C))
+    for b in prange(nblk):
+        for i in range(b * bs, min(R, (b + 1) * bs)):
+            mass_row = i % ncomp == 0
+            for c in range(C):
+                v = src[i, c] + nxt[i, c] * mask[i, c]
+                nxt[i, c] = v
+                if mass_row:
+                    part[b, c] += abs(v - cur[i, c])
+    return part.sum(0)
+
+
+@njit(parallel=True, cache=True)
+def voxel_density(S, beta, colsign, c0, n_vox, rows_per_vox):
+    """Per voxel: sum over its rows (classes x values) and the columns c0 .. c0 + len(colsign)
+    of S * beta * colsign -- ``paired_density`` summed over a voxel's classes, on a bundle's
+    columns inside its group's, without copying them."""
+    out = np.zeros(n_vox)
+    C = colsign.shape[0]
+    for v in prange(n_vox):
+        acc = 0.0
+        for r in range(v * rows_per_vox, (v + 1) * rows_per_vox):
+            for c in range(C):
+                acc += S[r, c0 + c] * beta[r, c0 + c] * colsign[c]
+        out[v] = acc
+    return out
+
+
+@njit(parallel=True, cache=True)
 def paired_density(S, beta, colsign, n_vox, rows_per_vox):
     """Per voxel: sum over its rows and the columns of S * beta * colsign."""
     out = np.zeros(n_vox)
@@ -734,10 +769,12 @@ def paired_density(S, beta, colsign, n_vox, rows_per_vox):
 
 
 @njit(cache=True)
-def half_values(hseed, lptr, lkey, lval, label, noff, tindex, aindex, nb, beta, absw, seed_ok, vals):
+def half_values(hseed, lptr, lkey, lval, label, noff, tindex, aindex, nb, beta, absw, seed_ok, vals,
+                c0=0):
     """vals[h, c] = P(half h completes column c's requirement): launched into a transient
     state -> beta there (paired over the values a state carries); into an absorbing voxel ->
-    absw.  Launches are sparse: keys n * nb + b sorted, values (ncomp,)."""
+    absw.  Launches are sparse: keys n * nb + b sorted, values (ncomp,).  ``c0``: the column
+    of ``beta`` that is column 0 here (a bundle's columns inside its group's)."""
     H, C = vals.shape
     nc = lval.shape[1]
     for h in range(H):
@@ -757,7 +794,7 @@ def half_values(hseed, lptr, lkey, lval, label, noff, tindex, aindex, nb, beta, 
                         o = lval[k, r]
                         if o != 0.0:
                             for c in range(C):
-                                vals[h, c] += o * beta[(base + b) * nc + r, c]
+                                vals[h, c] += o * beta[(base + b) * nc + r, c0 + c]
                     k += 1
             else:
                 s = 0.0
@@ -773,8 +810,9 @@ def half_values(hseed, lptr, lkey, lval, label, noff, tindex, aindex, nb, beta, 
 
 @njit(cache=True)
 def scatter_init(hseed, lptr, lkey, lval, coef, label, noff, tindex, aindex, nb, taboo, xcol,
-                 pi0, a0):
-    """pi0[:, c] += coef[h, c] * launch of h (taboo-masked); a0: absorbed on the launch step."""
+                 pi0, a0, c0=0):
+    """pi0[:, c0 + c] += coef[h, c] * launch of h (taboo-masked); a0: absorbed on the launch
+    step.  ``c0``: the column of ``pi0`` that is column 0 here."""
     H, C = coef.shape
     nc = lval.shape[1]
     for h in range(H):
@@ -795,7 +833,7 @@ def scatter_init(hseed, lptr, lkey, lval, coef, label, noff, tindex, aindex, nb,
                         continue
                     for j in range(k0, k):
                         for r in range(nc):
-                            pi0[(base + lkey[j] % nb) * nc + r, c] += cf * lval[j, r]
+                            pi0[(base + lkey[j] % nb) * nc + r, c0 + c] += cf * lval[j, r]
             else:
                 s = 0.0
                 for j in range(k0, k):

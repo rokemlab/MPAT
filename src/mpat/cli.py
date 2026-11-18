@@ -2,6 +2,7 @@
 import argparse
 import json
 import logging
+import os
 
 
 def main(argv=None):
@@ -26,6 +27,36 @@ def main(argv=None):
                    "output_dir is then only read for pyAFQ's derivatives")
     p.add_argument("--verbose", action="store_true",
                    help="log timing inside the solves (ms per power step)")
+    p.add_argument("--live", nargs="?", type=int, const=8765, default=None, metavar="PORT",
+                   help="show the bundles in 3-D as they are solved, on a web page served from this "
+                        "process (default port 8765, or the next free one): open the address it logs; "
+                        "from another machine, forward the port first (ssh -L PORT:localhost:PORT host). "
+                        "The backward and forward solves then advance together; same results")
+    p.add_argument("--gpu", nargs="?", const="cuda", default=None, metavar="DEVICE",
+                   help="run the solves on a GPU: the first CUDA device, or DEVICE (e.g. cuda:1). The "
+                        "chain is still built on the CPU (--n-proc)")
+    p.add_argument("--gpu-backend", choices=("warp", "numba"), default="warp",
+                   help="the GPU code's compiler: NVIDIA Warp (pip install warp-lang) or numba-cuda "
+                        "(pip install \"numba-cuda[cu13]\"); the same kernels either way")
+    p.add_argument("--gpu-weights", choices=("float64", "float32"), default="float64",
+                   help="transition probabilities on the GPU: float32 nearly halves the chain there "
+                        "(densities then agree with float64 to about 1e-5)")
+    p.add_argument("--transport", action="store_true",
+                   help="solve the bundles as linear transport, not the Markov chain: walkers run straight in any "
+                        "of the sphere's directions and turn by the fODF (mpat.transport); on a GPU with NVIDIA "
+                        "Warp (--gpu picks the device); outputs in <output_dir>/mpat-transport (or --out-dir); "
+                        "--tol, --angle (largest turn) and --colormap apply; with --viz-only / --rois-only, "
+                        "the figures / ROIs of a transport run")
+    p.add_argument("--transport-mfp", type=float, default=2.0,
+                   help="--transport: mean straight run between turns, mm (default 2)")
+    p.add_argument("--transport-upsample", type=float, default=None, metavar="MM",
+                   help="--transport: solve on isotropic voxels of MM mm (e.g. 1.0) instead of the fODF's grid: "
+                        "less sideways blur, more memory and time (outputs on that grid)")
+    p.add_argument("--transport-max-iter", type=int, default=5000,
+                   help="--transport: sweeps per solve at most (one turn each; default 5000)")
+    p.add_argument("--transport-sphere", default="symmetric362",
+                   help="--transport: the walkers' directions, a DIPY sphere (default symmetric362; also "
+                        "repulsion200, symmetric642, repulsion724)")
     p.add_argument("--mni-thalamus", action="store_true",
                    help="keep the template's thalamic start / end ROIs (default: SynthSeg's thalami)")
     p.add_argument("--no-viz", action="store_true",
@@ -106,6 +137,13 @@ def main(argv=None):
     else:
         kwargs["tracking_params"] = {"odf_model": "CSD"}
 
+    if a.transport and not (a.rois_only or a.viz_only):    # linear transport on a GPU, not the chain
+        from .transport import run_cli
+
+        run_cli(ParticipantAFQ(a.dwi, a.bval, a.bvec, a.t1, a.output_dir, **kwargs), a)
+        return
+    if a.transport and not a.out_dir:          # --rois-only / --viz-only of a transport run
+        a.out_dir = os.path.join(a.output_dir, "mpat-transport")
     afq = ParticipantAFQ(a.dwi, a.bval, a.bvec, a.t1, a.output_dir, **kwargs)
     if a.rois_only:
         page = write_rois(afq, a.bundles, a.moments, synthseg_thalamus=not a.mni_thalamus, no_midline=a.no_midline,
@@ -127,7 +165,9 @@ def main(argv=None):
         ptt=a.ptt, step=a.step, stop_mass=a.stop_mass, fod_thresh=a.fod_thresh,
         fod_power=a.fod_power, curv_sigma=a.curv_sigma, probe_radius=a.probe_radius,
         sift2=a.sift2, arbor=a.arbor, arbor_branches=a.arbor_branches,
-        save_transitions=a.save_transitions or False)
+        save_transitions=a.save_transitions or False,
+        live=a.live, gpu=a.gpu, gpu_weights=a.gpu_weights,
+        gpu_backend={"numba": "numba-cuda"}.get(a.gpu_backend, a.gpu_backend))
     if a.pyafq:   # pyAFQ's recognition: MPAT's rules removed, MPAT-only bundles (fornix) dropped
         from .bundles import pyafq_bd
 

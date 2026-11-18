@@ -68,3 +68,17 @@
 
 .. autofunction:: mpat.moments.stabilize
 ```
+
+## On a GPU
+
+```{eval-rst}
+.. autoclass:: mpat.gpu.DeviceOps
+
+.. autoclass:: mpat.gpu.WarpOps
+
+.. autoclass:: mpat.gpu.NumbaCudaOps
+
+.. autofunction:: mpat.gpu.available
+
+.. autofunction:: mpat.gpu.get_device
+```
