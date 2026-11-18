@@ -24,13 +24,9 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      # MITTENS v2 (mittens-dmri) builds from GitHub with Rust
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
       - name: Install MPAT with the docs and test extras
         run: |
-          python -m pip install --upgrade pip maturin
+          python -m pip install --upgrade pip
           python -m pip install -e ".[docs,test]"
 
       # rendered animations and the phantom's chains are reused while the scripts and
@@ -75,10 +71,9 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-      - uses: dtolnay/rust-toolchain@stable
       - name: Install
         run: |
-          python -m pip install --upgrade pip maturin
+          python -m pip install --upgrade pip
           python -m pip install -e ".[docs]"
       - name: Check external links
         env:

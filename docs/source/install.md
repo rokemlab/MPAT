@@ -1,13 +1,15 @@
 # Installation
 
-MPAT needs Python 3.10 or newer. It depends on [MITTENS](https://github.com/mattcieslak/MITTENS)
-v2 (`mittens-dmri`), which is not on PyPI yet, so pip builds it from GitHub. That build needs a
-Rust toolchain ([rustup.rs](https://rustup.rs)) and `maturin`:
+MPAT needs Python 3.10 or newer. Install it from GitHub:
 
 ```bash
-pip install maturin
-pip install "mpat-tractography[viewer] @ git+https://github.com/36000/MPAT.git"
+pip install "mpat-tractography[viewer] @ git+https://github.com/rokemlab/MPAT.git"
 ```
+
+It depends on [MITTENS](https://github.com/mattcieslak/MITTENS) v2 (`mittens-dmri`), which pip
+installs from PyPI as a prebuilt wheel for Linux (x86_64, aarch64), macOS (Intel, Apple Silicon)
+and Windows, so no compiler is needed. On other platforms pip builds it from source, which needs a
+Rust toolchain ([rustup.rs](https://rustup.rs)).
 
 Extras:
 
