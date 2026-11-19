@@ -3,7 +3,7 @@
 ## From Python
 
 MPAT runs on top of a pyAFQ
-[`ParticipantAFQ`](https://tractometry.org/pyAFQ/reference/api.html), or every participant of a
+[`ParticipantAFQ`](https://tractometry.org/pyAFQ/reference/api/AFQ/api/participant/index.html#AFQ.api.participant.ParticipantAFQ), or every participant of a
 `GroupAFQ`. pyAFQ computes the derivatives MPAT needs: the fODF, the tissue PVE and brain
 mask, the white/grey-matter interface, and the bundle ROIs warped to the subject. MPAT then
 replaces the tracking and segmentation:
