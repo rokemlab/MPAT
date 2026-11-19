@@ -31,11 +31,11 @@ mpat sub-01_dwi.nii.gz sub-01_dwi.bval sub-01_dwi.bvec sub-01_T1w.nii.gz out/ --
 ## Install
 
 ```bash
-pip install maturin                                   # MITTENS v2 builds with Rust (https://rustup.rs)
-pip install "mpat-tractography[viewer] @ git+<this repository>"
+pip install "mpat-tractography[viewer] @ git+https://github.com/rokemlab/MPAT.git"
 ```
 
-MITTENS v2 (`mittens-dmri`) is not on PyPI yet, so pip builds it from GitHub with your Rust toolchain.
+MITTENS v2 (`mittens-dmri`) comes from PyPI as a prebuilt wheel for Linux, macOS and Windows, so no
+compiler is needed.
 
 ## Options
 

@@ -12,8 +12,8 @@ license = { text = "BSD-3-Clause" }
 dependencies = [
     "numpy>=1.26", "scipy>=1.11", "nibabel>=5", "numba>=0.59", "dipy>=1.9", "scikit-image",
     "pyAFQ>=3.4", "trx-python",
-    # MITTENS v2 is not on PyPI yet (it builds with a Rust toolchain via maturin)
-    "mittens-dmri @ git+https://github.com/mattcieslak/MITTENS.git",
+    # MITTENS v2: prebuilt wheels on PyPI. Naming the pre-release lets pip pick it without --pre
+    "mittens-dmri>=2.0.0a1",
 ]
 
 [project.optional-dependencies]

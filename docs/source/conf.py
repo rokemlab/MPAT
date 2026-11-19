@@ -91,7 +91,12 @@ html_context = {"default_mode": "light"}
 html_sidebars = {"**": []}          # navigation lives in the header; pages use the full width
 html_show_sourcelink = False
 
-linkcheck_ignore = [r"https://github\.com/rokemlab/MPAT.*"]
+linkcheck_ignore = [
+    r"https://github\.com/rokemlab/MPAT.*",
+    # AGU (Wiley) and SIAM answer automated requests with 403 Forbidden; their DOIs resolve
+    r"https://doi\.org/10\.1029/",
+    r"https://doi\.org/10\.1137/",
+]
 
 # ------------------------------------------------------------------ build environment
 # the `mpat` console script lives next to the interpreter running Sphinx (virtualenvs)
