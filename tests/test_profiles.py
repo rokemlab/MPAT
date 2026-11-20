@@ -1,0 +1,433 @@
+"""Tract profiles from MPAT density maps (mpat.profiles; rokemlab/MPAT issue 6).
+
+Expected values come from outside mpat.profiles: pyAFQ's own Mahalanobis weighting (and the
+numbers pinned in pyAFQ's ``test_mahal_fix``), hand calculation, geometry simple enough to know
+each voxel's arc length along the core, and voxels supersampled by brute force.
+"""
+import csv
+import json
+
+import nibabel as nib
+import numpy as np
+import numpy.testing as npt
+import pytest
+
+from mpat.profiles import _box_cdf, _mahalanobis, _project, _spread, _weights, tract_profiles, write_profiles
+
+# --- weighted geometry and estimator --------------------------------------------------------
+
+# pyAFQ's test_mahal_fix: 20 streamlines, two nodes each, and the Mahalanobis distances pyAFQ
+# pins for the first three streamlines:
+# https://github.com/tractometry/pyAFQ/blob/65a43a88ff1cf1e681a04a47010c9bb8dbb07ed8/AFQ/tests/test_fixes.py#L55-L91
+MAHAL_SLS = np.array([
+    [[30, 41, 61], [28, 61, 38]], [[30, 41, 62], [20, 44, 34]], [[50, 67, 88], [10, 10, 20]],
+    [[35, 43, 65], [25, 55, 35]], [[40, 50, 70], [15, 15, 25]], [[45, 54, 75], [12, 22, 32]],
+    [[32, 48, 68], [28, 58, 40]], [[38, 52, 72], [18, 38, 28]], [[34, 44, 64], [21, 41, 31]],
+    [[36, 46, 66], [23, 53, 33]], [[37, 47, 67], [24, 54, 34]], [[39, 49, 69], [19, 39, 29]],
+    [[33, 53, 73], [22, 42, 32]], [[31, 51, 71], [26, 56, 36]], [[29, 59, 79], [27, 57, 37]],
+    [[28, 58, 78], [17, 47, 27]], [[27, 57, 77], [16, 36, 26]], [[26, 56, 76], [14, 24, 34]],
+    [[25, 55, 75], [13, 23, 33]], [[24, 54, 74], [11, 21, 31]]], float)
+MAHAL_PINNED = np.array([[1.718654, 1.550252], [2.202227, 0.7881], [3.415999, 2.689814]])
+
+
+def test_unit_density_reproduces_pyafq_mahalanobis():
+    """With equal densities the estimator is pyAFQ's (population covariance, pinvh)."""
+    for node in range(2):
+        D = _mahalanobis(MAHAL_SLS[:, node], np.ones(20))
+        npt.assert_allclose(D[:3], MAHAL_PINNED[:, node], atol=1e-6)
+
+
+def _pyafq_replicated(x, d):
+    """pyAFQ's Mahalanobis distances and weights for x with each point repeated d_i times."""
+    from AFQ._fixes import gaussian_weights
+
+    rep = np.repeat(x, d, axis=0)[:, None]               # (n_sls, 1 node, 3)
+    groups = np.zeros(rep.shape[:2], int)
+    D = gaussian_weights(rep, assignment_idxs=groups, n_points=None, return_mahalanobis=True)[:, 0]
+    w = gaussian_weights(rep, assignment_idxs=groups, n_points=None)[:, 0]
+    first = np.r_[0, np.cumsum(d)[:-1]]
+    return D[first], w, np.repeat(np.arange(len(x)), d)
+
+
+# a small, asymmetric, non-planar cross-section with unequal integer densities (mm)
+XSEC = np.array([[0, 0, 0], [2, 0, 0], [0, 2, 0], [2, 2, 1], [4, 1, 0], [1, 3, 2], [3, 3, 0]], float)
+XSEC_D = np.array([1, 5, 2, 3, 1, 4, 2])                 # sum 18 >= pyAFQ's 15-point minimum
+XSEC_S = np.array([0.30, 0.55, 0.41, 0.62, 0.20, 0.48, 0.71])
+
+
+def test_density_weights_equal_replicated_points():
+    """Density d_i is exactly a voxel repeated d_i times: the weighted mean and population
+    covariance give pyAFQ's Mahalanobis distances on the replicated points."""
+    D_ref, _, _ = _pyafq_replicated(XSEC, XSEC_D)
+    npt.assert_allclose(_mahalanobis(XSEC, XSEC_D.astype(float)), D_ref, rtol=1e-10)
+    # ...which unweighted geometry does not give
+    assert np.abs(_mahalanobis(XSEC, np.ones(len(XSEC))) - D_ref).max() > 1e-3
+
+
+@pytest.mark.parametrize("flat", [(2,), (1, 2)], ids=["planar", "linear"])
+def test_thin_cross_sections_use_the_pseudoinverse(flat):
+    """Rank-2 and rank-1 cross-sections are valid: pinvh agrees with pyAFQ, and every
+    inverse-distance weight is finite and positive (no fallback)."""
+    x = XSEC.copy()
+    x[:, list(flat)] = 7.0
+    x[:, 0] = XSEC[:, 0] + 0.1 * np.arange(len(x))      # keep the points distinct
+    D_ref, _, _ = _pyafq_replicated(x, XSEC_D)
+    npt.assert_allclose(_mahalanobis(x, XSEC_D.astype(float)), D_ref, rtol=1e-8)
+    w = _weights(x, XSEC_D.astype(float), np.zeros(len(x), int), 1, "mahalanobis")
+    assert np.all(np.isfinite(w) & (w > 0))
+
+
+def test_mahalanobis_weighting_reproduces_pyafq_on_replicated_points():
+    """weighting="mahalanobis" with density d_i is pyAFQ's inverse-distance profile on each voxel
+    repeated d_i times -- which neither unweighted geometry nor density-only weighting gives."""
+    D_ref, w_ref, which = _pyafq_replicated(XSEC, XSEC_D)
+    w = _weights(XSEC, XSEC_D.astype(float), np.zeros(len(XSEC), int), 1, "mahalanobis")
+    expected = (w_ref * XSEC_S[which]).sum()              # pyAFQ weights already sum to one
+    npt.assert_allclose((w * XSEC_S).sum() / w.sum(), expected, rtol=1e-10)
+    D_unweighted = _mahalanobis(XSEC, np.ones(len(XSEC)))
+    unweighted = (XSEC_D / D_unweighted * XSEC_S).sum() / (XSEC_D / D_unweighted).sum()
+    density_only = (XSEC_D * XSEC_S).sum() / XSEC_D.sum()
+    assert abs(unweighted - expected) > 1e-3 and abs(density_only - expected) > 1e-3
+
+
+def test_mahalanobis_one_voxel_node_falls_back_locally():
+    """A one-voxel node (D = 0, so no finite inverse distance) is weighted by density alone; the
+    other nodes are untouched."""
+    x = np.vstack([XSEC, [[50, 50, 50]]])
+    d = np.r_[XSEC_D, 3.0]
+    owner = np.r_[np.zeros(len(XSEC), int), 1]
+    w = _weights(x, d, owner, 2, "mahalanobis")
+    assert w[-1] == 3.0
+    alone = _weights(XSEC, XSEC_D.astype(float), np.zeros(len(XSEC), int), 1, "mahalanobis")
+    npt.assert_allclose(w[:-1], alone, rtol=1e-12)
+
+
+def test_mahalanobis_zero_and_near_zero_distance():
+    """pyAFQ's rule: an infinite inverse distance becomes zero weight; a near-centre voxel keeps
+    its (large) finite d / D.  Symmetric square + its exact centre, then the centre nudged."""
+    sq = np.array([[-1, -1, 0], [1, -1, 0], [-1, 1, 0], [1, 1, 0], [0, 0, 0]], float)
+    d = np.ones(5)
+    w = _weights(sq, d, np.zeros(5, int), 1, "mahalanobis")
+    assert w[4] == 0 and np.all(w[:4] > 0)                 # the exact centre is discarded
+    nudged = sq.copy()
+    nudged[4, 0] = 1e-6
+    w2 = _weights(nudged, d, np.zeros(5, int), 1, "mahalanobis")
+    npt.assert_allclose(w2, d / _mahalanobis(nudged, d))
+    assert w2[4] / w2.sum() > 0.99                        # ...and dominates the node
+
+
+def test_density_weighting_is_the_density_weighted_mean():
+    """weighting="density" (the default) ignores the cross-section geometry: w_i = d_i."""
+    sq = np.array([[-1, -1, 0], [1, -1, 0], [-1, 1, 0], [1, 1, 0], [0, 0, 0]], float)
+    d = np.array([1.0, 2, 3, 4, 5])
+    npt.assert_array_equal(_weights(sq, d, np.zeros(5, int), 1), d)
+    with pytest.raises(ValueError):
+        _weights(sq, d, np.zeros(5, int), 1, "inverse")
+
+
+# --- position along the core ----------------------------------------------------------------
+
+def _u_bundle():
+    """Two one-voxel-wide arms (y=1 and y=3) joined at x=20, with an empty row between them."""
+    keep = np.zeros((23, 5, 3), bool)
+    keep[1:21, 1, 1] = keep[1:21, 3, 1] = True
+    keep[20, 1:4, 1] = True
+    nodes_vox = np.array([[1, 1, 1], [8, 1, 1], [15, 1, 1], [20, 2, 1],
+                          [18, 3, 1], [11, 3, 1], [4, 3, 1]], float)
+    return keep, nodes_vox
+
+
+def test_projection_follows_the_bundle_not_the_nearest_node():
+    """Segments, not vertices: each voxel of a U's arms lies on its own arm's segments, so its arc
+    length is its distance along that arm, also where a node of the other arm is its nearest node.
+    (Past the core's last node, x < 4 on the y = 3 arm, the voxels are nearer the other arm's first
+    segment than the last node, and go there: the limit of projecting without a graph search.)"""
+    keep, nodes_vox = _u_bundle()
+    aff = np.diag([2.0, 2.0, 2.0, 1.0])
+    core = nodes_vox @ aff[:3, :3].T
+    ijk = np.argwhere(keep)
+    s, _ = _project(ijk @ aff[:3, :3].T, core)
+    s_node = np.r_[0, np.cumsum(np.linalg.norm(np.diff(core, axis=0), axis=1))]
+    arm_of_node = np.array([1, 1, 1, -1, 3, 3, 3])
+    checked = nearest_node_wrong = 0
+    for (i, j, _), s_i in zip(ijk, s):
+        if i > 15 or (j == 3 and i < 4):
+            continue                                      # the bend; past the core's last node
+        along_arm = 2.0 * (i - 1) if j == 1 else s_node[4] + 2.0 * (18 - i)
+        npt.assert_allclose(s_i, along_arm, atol=1e-9, err_msg=str((i, j)))
+        checked += 1
+        nearest = np.argmin(np.linalg.norm(nodes_vox - [i, j, 1], axis=1))
+        nearest_node_wrong += arm_of_node[nearest] != j
+    assert checked == 27 and nearest_node_wrong > 0      # the case discriminates
+
+
+def test_projection_is_continuous_and_runs_past_the_ends():
+    """On a bent core: arc length is continuous along a segment (not snapped to nodes), points
+    beyond the end nodes get s < 0 or s > length, and a point outside the bend maps to its node."""
+    core = np.array([[0, 0, 0], [10, 0, 0], [10, 10, 0]], float)
+    x = np.array([[3.3, 1, 0], [-4, 0.5, 0], [10, 17, 0], [12, -2, 0], [10.2, 6.5, 0.2]])
+    s, u = _project(x, core)
+    npt.assert_allclose(s, [3.3, -4, 27, 10, 16.5], atol=1e-12)
+    npt.assert_allclose(u[[0, 1, 2, 4]], [[1, 0, 0], [1, 0, 0], [0, 1, 0], [0, 1, 0]], atol=1e-12)
+
+
+def test_coincident_and_collapsed_nodes():
+    """Nodes keep their numbers: a zero-length segment is skipped, and two coincident nodes split
+    their stretch of the core at the point they share.  A core collapsed to a single point gives
+    every voxel wholly to node 0."""
+    core = np.array([[0, 0, 0], [5, 0, 0], [5, 0, 0], [10, 0, 0]], float)
+    s, _ = _project(np.array([[7.0, 1, 0], [12, 0, 0], [-1, 0, 0]]), core)
+    npt.assert_allclose(s, [7, 12, -1], atol=1e-12)
+    vox, node, share = _spread(np.array([[4.0, 0, 0], [6, 0, 0]]), core, np.eye(4))
+    npt.assert_array_equal(vox, [0, 1])
+    npt.assert_array_equal(node, [1, 2])
+    npt.assert_allclose(share, 1, atol=1e-12)
+
+    assert _project(np.zeros((2, 3)), np.ones((4, 3))) is None
+    d, aff, core = _straight_bundle()
+    prof, info = tract_profiles(d, aff, np.repeat(core[4:5], 5, 0), {"x": nib.Nifti1Image(d, aff)})
+    assert np.isfinite(prof["x"][0]) and np.all(np.isnan(prof["x"][1:]))
+    assert info["empty_nodes"] == [1, 2, 3, 4]
+
+
+# --- spreading each voxel along the core ----------------------------------------------------
+
+def test_box_cdf_is_the_sum_of_uniforms():
+    """Irwin-Hall: the sum of three U(0, 1) has CDF 1/6 at 1 and 1/2 at 1.5 (here centred: -0.5, 0);
+    two U(0, 1): 1/8 at 0.5; one: linear.  A width -> 0 approaches the case without it."""
+    z = np.array([[-0.5, 0.0, 1.5, -1.5]])
+    npt.assert_allclose(_box_cdf(z, np.ones((1, 3))), [[1 / 6, 0.5, 1, 0]], atol=1e-12)
+    npt.assert_allclose(_box_cdf(np.array([[-0.5]]), np.array([[1.0, 1.0, 0.0]])), [[1 / 8]], atol=1e-12)
+    npt.assert_allclose(_box_cdf(np.array([[0.25]]), np.array([[1.0, 0.0, 0.0]])), [[0.75]], atol=1e-12)
+    z = np.linspace(-2, 2, 41)[None]
+    npt.assert_allclose(_box_cdf(z, np.array([[2.0, 1.0, 1e-5]])), _box_cdf(z, np.array([[2.0, 1.0, 0.0]])),
+                        atol=1e-5)
+    # six widths (the linear kernel): Irwin-Hall n = 6 is symmetric, and 1/720 at 1 (centred: -2)
+    npt.assert_allclose(_box_cdf(np.array([[0.0, -2.0]]), np.ones((1, 6))), [[0.5, 1 / 720]], atol=1e-12)
+
+
+def test_spread_shares_by_hand():
+    """2 mm voxels, core along x with nodes every 1 mm: a voxel centred on node 5 covers
+    [4, 6] mm, so it is 1/4 node 4, 1/2 node 5 and 1/4 node 6."""
+    aff = np.diag([2.0, 2.0, 2.0, 1.0])
+    core = np.stack([np.arange(11.0), np.zeros(11), np.zeros(11)], 1)
+    vox, node, share = _spread(np.array([[5.0, 0, 0]]), core, aff, "box")
+    npt.assert_array_equal(vox, 0)
+    npt.assert_array_equal(node, [4, 5, 6])
+    npt.assert_allclose(share, [0.25, 0.5, 0.25], atol=1e-12)
+
+
+def _supersampled_shares(x, affine, core, n=60):
+    """Brute force on a straight core: split each voxel's cube into n^3 sub-cubes, place each
+    sub-centre at its arc length along the core's line, and count them into the nodes' bins."""
+    c = (np.arange(n) + 0.5) / n - 0.5
+    sub = np.stack(np.meshgrid(c, c, c, indexing="ij"), -1).reshape(-1, 3) @ affine[:3, :3].T
+    u = (core[-1] - core[0]) / np.linalg.norm(core[-1] - core[0])
+    s_node = (core - core[0]) @ u
+    edges = np.r_[-np.inf, (s_node[:-1] + s_node[1:]) / 2, np.inf]
+    out = np.zeros((len(x), len(core)))
+    for i, xi in enumerate(x):
+        out[i] = np.bincount(np.searchsorted(edges, (xi + sub - core[0]) @ u) - 1, minlength=len(core))
+    return out / len(sub)
+
+
+def test_spread_is_the_limit_of_supersampling():
+    """On a straight core a voxel's shares are what infinitely fine supersampling of its cube
+    gives -- here with an oblique core, unevenly spaced nodes closer than a voxel, voxels past both
+    ends, and a sheared, anisotropic grid.  Each voxel's shares sum to one."""
+    affine = np.array([[1.8, 0.3, 0, 5], [0, 2.2, -0.4, -3], [0.2, 0, 2.5, 1], [0, 0, 0, 1]])
+    rng = np.random.default_rng(0)
+    u = np.array([2.0, 1.0, -0.5]) / np.linalg.norm([2.0, 1.0, -0.5])
+    t = np.cumsum(np.r_[0, rng.uniform(0.4, 1.6, 30)])
+    core = np.array([1, -2, 3.0]) + t[:, None] * u
+    x = core[0] + rng.uniform(-4, t[-1] + 4, 16)[:, None] * u + rng.normal(0, 3, (16, 3))
+    vox, node, share = _spread(x, core, affine, "box")
+    W = np.zeros((len(x), len(core)))
+    np.add.at(W, (vox, node), share)
+    npt.assert_allclose(W.sum(1), 1, atol=1e-12)
+    npt.assert_allclose(W, _supersampled_shares(x, affine, core), atol=1e-3)
+
+
+def test_linear_kernel_by_hand():
+    """The same voxel's trilinear hat is a tent on [3, 7] mm, density (2 - |z|) / 4: by hand its
+    shares of nodes 3..7 are 1/32, 1/4, 7/16, 1/4, 1/32."""
+    aff = np.diag([2.0, 2.0, 2.0, 1.0])
+    core = np.stack([np.arange(11.0), np.zeros(11), np.zeros(11)], 1)
+    _, node, share = _spread(np.array([[5.0, 0, 0]]), core, aff, "linear")
+    npt.assert_array_equal(node, [3, 4, 5, 6, 7])
+    npt.assert_allclose(share, [1 / 32, 1 / 4, 7 / 16, 1 / 4, 1 / 32], atol=1e-12)
+
+
+def test_linear_kernel_is_the_projected_trilinear_hat():
+    """Against the hat's projection computed independently: the six boxes convolved numerically on
+    a fine grid, then integrated over each node's bin (straight oblique core, sheared grid)."""
+    affine = np.array([[1.8, 0.3, 0, 5], [0, 2.2, -0.4, -3], [0.2, 0, 2.5, 1], [0, 0, 0, 1]])
+    u = np.array([2.0, 1.0, -0.5]) / np.linalg.norm([2.0, 1.0, -0.5])
+    core = np.arange(20)[:, None] * 0.9 * u
+    x = core[[3, 9, 15]] + [[0.3, -1, 0.5], [2, 0, -1], [-0.4, 0.2, 0.1]]
+    vox, node, share = _spread(x, core, affine, "linear")
+    W = np.zeros((len(x), len(core)))
+    np.add.at(W, (vox, node), share)
+    dz = 1e-3
+    pdf = np.ones(1)
+    for wk in np.repeat(np.abs(u @ affine[:3, :3]), 2):
+        pdf = np.convolve(pdf, np.ones(max(1, round(wk / dz))) / max(1, round(wk / dz)))
+    z = (np.arange(len(pdf)) - (len(pdf) - 1) / 2) * dz
+    s_node = (core - core[0]) @ u
+    edges = np.r_[-np.inf, (s_node[:-1] + s_node[1:]) / 2, np.inf]
+    for i, xi in enumerate(x):
+        k = np.searchsorted(edges, (xi - core[0]) @ u + z) - 1
+        npt.assert_allclose(W[i], np.bincount(k, pdf, len(core)), atol=2e-3)
+
+
+def test_spread_fills_nodes_closer_than_a_voxel():
+    """Nodes every half voxel along a straight tube: giving each voxel to its nearest node leaves
+    nodes without voxels, spreading gives every node a share, and each voxel's shares sum to one."""
+    d, aff, _ = _straight_bundle()
+    n = 40
+    core = nib.affines.apply_affine(aff, np.stack([np.linspace(2, 21, n), np.full(n, 3.0), np.full(n, 3.0)], 1))
+    x = nib.affines.apply_affine(aff, np.argwhere(d > 0))
+    nearest = np.linalg.norm(x[:, None] - core, axis=-1).argmin(1)
+    assert len(np.setdiff1d(np.arange(n), nearest)) > 0
+    vox, node, share = _spread(x, core, aff)
+    npt.assert_array_equal(np.unique(node), np.arange(n))
+    npt.assert_allclose(np.bincount(vox, share, len(x)), 1, atol=1e-9)
+
+
+# --- scalars on another grid ----------------------------------------------------------------
+
+def _scalar_img():
+    """A linear field on an anisotropic, shifted, flipped grid; linear interpolation is exact."""
+    aff = np.array([[-1.5, 0, 0, 20], [0, 1.0, 0, -3], [0, 0, 2.5, 1], [0, 0, 0, 1]])
+    ijk = np.moveaxis(np.indices((12, 9, 6), dtype=float), 0, -1)
+    xyz = nib.affines.apply_affine(aff, ijk)
+    field = lambda p: 0.1 * p[..., 0] - 0.05 * p[..., 1] + 0.02 * p[..., 2] - 1.0  # noqa: E731
+    return aff, field(xyz), field
+
+
+# --- integration and output -----------------------------------------------------------------
+
+def _straight_bundle():
+    """A 3x3-voxel tube along x (2 mm voxels), density peaking on its axis, plus a faint far island."""
+    d = np.zeros((24, 7, 7))
+    prof = np.array([0.4, 1.0, 0.4])
+    d[2:22, 2:5, 2:5] = prof[None, :, None] * prof[None, None, :] * np.linspace(1, 2, 20)[:, None, None]
+    d[2:22, 3, 3] += 0.05 * np.arange(20) % 3           # break the cross-sections' symmetry
+    d[23, 0, 0] = 1e-3                                    # a disconnected island: still counted
+    aff = np.diag([2.0, 2.0, 2.0, 1.0])
+    aff[:3, 3] = [-10, 4, 7]
+    n = 10
+    x_vox = np.linspace(2, 21, n)
+    core = nib.affines.apply_affine(aff, np.stack([x_vox, np.full(n, 3.0), np.full(n, 3.0)], 1))
+    return d, aff, core
+
+
+def test_profile_end_to_end():
+    d, aff, core = _straight_bundle()
+    s_aff, s_data, field = _scalar_img()
+    s_aff = s_aff.copy()
+    s_aff[:3, :] = [[-4, 0, 0, 36], [0, 1, 0, 5], [0, 0, 2.5, 3]]  # a grid holding the bundle
+    s_data = field(nib.affines.apply_affine(s_aff, np.moveaxis(np.indices(s_data.shape, float), 0, -1)))
+    holes = s_data.copy()
+    holes[...] = np.nan                                   # an all-invalid scalar
+    scalars = {"lin": nib.Nifti1Image(s_data, s_aff), "none": nib.Nifti1Image(holes, s_aff)}
+    prof, info = tract_profiles(d, aff, core, scalars)
+    assert prof["lin"].shape == (10,) and np.all(np.isnan(prof["none"]))
+    # each node's profile is a convex combination of a linear field over its own slab of the tube
+    npt.assert_allclose(prof["lin"], field(core), atol=0.12)
+    assert np.all(np.diff(np.sign(np.diff(prof["lin"]))) == 0)  # monotone along x, in node order
+    assert info["n_voxels"] == np.count_nonzero(d)       # every voxel with density, the island too
+    assert info["empty_nodes"] == []
+
+    rev, _ = tract_profiles(d, aff, core[::-1], {"lin": nib.Nifti1Image(s_data, s_aff)})
+    npt.assert_allclose(rev["lin"], prof["lin"][::-1], rtol=1e-12)
+
+    mahal, _ = tract_profiles(d, aff, core, scalars, weighting="mahalanobis")
+    npt.assert_allclose(mahal["lin"], field(core), atol=0.12)
+    assert not np.allclose(mahal["lin"], prof["lin"])
+
+
+def test_voxels_outside_a_scalars_grid_have_no_value():
+    """A scalar map covering only the first half of the tube: nodes beyond it are NaN, not pulled
+    towards 0, and the nodes inside match the full map's away from its edge."""
+    d, aff, core = _straight_bundle()
+    full = np.full(d.shape, 0.5)
+    prof, _ = tract_profiles(d, aff, core, {"s": nib.Nifti1Image(full, aff)})
+    half, _ = tract_profiles(d, aff, core, {"s": nib.Nifti1Image(full[:12], aff)})
+    npt.assert_allclose(prof["s"], 0.5, rtol=1e-6)
+    assert np.all(np.isnan(half["s"][-3:]))
+    npt.assert_allclose(half["s"][np.isfinite(half["s"])], 0.5, rtol=1e-6)
+
+
+def test_empty_bundle_returns_nan_nodes():
+    d, aff, core = _straight_bundle()
+    prof, info = tract_profiles(np.zeros_like(d), aff, None, {"FA": nib.Nifti1Image(d, aff)}, n_nodes=7)
+    assert prof["FA"].shape == (7,) and np.all(np.isnan(prof["FA"]))
+    assert info["status"] == "empty"
+    prof, info = tract_profiles(d, aff, None, {"FA": nib.Nifti1Image(d, aff)}, n_nodes=7)
+    assert np.all(np.isnan(prof["FA"])) and info["status"] == "no core"   # write_cores found none
+
+
+@pytest.mark.parametrize("bad", [-1.0, np.nan, np.inf])
+def test_invalid_density_is_zero_as_in_bundle_core(bad):
+    """bundle_core reads density as clip(nan_to_num(d), 0): NaN and negative voxels are empty,
+    +Inf the largest float.  The profiles do the same rather than raising."""
+    d, aff, core = _straight_bundle()
+    lin = {"x": nib.Nifti1Image(d, aff)}
+    d_bad = d.copy()
+    d_bad[5, 3, 3] = bad
+    expected = np.clip(np.nan_to_num(d_bad), 0, None)
+    prof, _ = tract_profiles(d_bad, aff, core, lin)
+    ref, _ = tract_profiles(expected, aff, core, lin)
+    npt.assert_array_equal(prof["x"], ref["x"])
+
+
+def test_write_profiles(tmp_path):
+    from mpat.core import Core, write_core
+
+    d, aff, core = _straight_bundle()
+    stem = tmp_path / "sub-01_dwi_space-RASMM_model-probCSD"
+    for name, dens in (("LeftArc", d), ("Empty", np.zeros_like(d))):
+        pre = f"{stem}_bundle-{name}"
+        nib.save(nib.Nifti1Image(dens.astype(np.float32), aff), f"{pre}_desc-density_map.nii.gz")
+        with open(f"{pre}_desc-summary.json", "w") as fh:
+            json.dump(dict(bundle="Left Arcuate" if name == "LeftArc" else "Empty one"), fh)
+    write_core(Core(core, np.ones(len(core)), 1.0, "test"), f"{stem}_bundle-LeftArc")
+    s_aff, s_data, _ = _scalar_img()
+    s_aff[:3, :] = [[-4, 0, 0, 36], [0, 1, 0, 5], [0, 0, 2.5, 3]]
+    fa = tmp_path / "fa.nii.gz"
+    nib.save(nib.Nifti1Image(np.abs(s_data).astype(np.float32), s_aff), fa)
+
+    out = write_profiles(tmp_path, {"dti_fa": fa})
+    assert out.endswith("_desc-profiles_tractography.csv")
+    with open(out) as fh:
+        rows = list(csv.DictReader(fh))
+    assert list(rows[0]) == ["tractID", "nodeID", "dti_fa"]
+    by = {}
+    for r in rows:
+        by.setdefault(r["tractID"], []).append(r)
+    # bundles in file order; the empty bundle still has a row per node (of the core's count)
+    assert list(by) == ["Empty one", "Left Arcuate"]
+    assert [int(r["nodeID"]) for r in by["Left Arcuate"]] == list(range(10))
+    assert all(r["dti_fa"] for r in by["Left Arcuate"])
+    assert len(by["Empty one"]) == 100 and not any(r["dti_fa"] for r in by["Empty one"])
+    meta = json.load(open(out[: -len(".csv")] + ".json"))
+    assert meta["bundles"]["Empty one"]["status"] == "empty"
+    assert meta["bundles"]["Left Arcuate"]["status"] == "ok"
+    assert meta["scalars"] == {"dti_fa": str(fa)}
+
+    # n_nodes resamples each core (same ends, equal spacing): 4 nodes for every bundle, and the
+    # profile is tract_profiles on that core
+    from mpat.core import _resample
+
+    with open(write_profiles(tmp_path, {"dti_fa": fa}, n_nodes=4)) as fh:
+        rows = list(csv.DictReader(fh))
+    by = {}
+    for r in rows:
+        by.setdefault(r["tractID"], []).append(r)
+    assert [len(v) for v in by.values()] == [4, 4]
+    four = _resample(core, 4)
+    npt.assert_allclose(four[[0, -1]], core[[0, -1]])
+    expected, _ = tract_profiles(d, aff, four, {"dti_fa": nib.load(fa)})
+    npt.assert_allclose([float(r["dti_fa"]) for r in by["Left Arcuate"]], expected["dti_fa"], rtol=1e-6)
+    assert json.load(open(out[: -len(".csv")] + ".json"))["n_nodes"] == 4
