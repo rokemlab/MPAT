@@ -12,8 +12,6 @@ beyond that is a rule, kept as data in one place:
 
 Rules (``RULE_DEFAULTS`` hold for every bundle that does not set them):
 
-    midline_tol        mm past the midline (world x = 0) a cross_midline=False bundle may go
-                       before the other hemisphere is excluded (0: cut at x = 0)
     exclude_mni_boxes  extra exclusion ROIs, MNI boxes {x: (lo, hi), y: ..., z: ...} in mm,
                        warped with pyAFQ's mapping
     include_mni_boxes  the same, as inclusion ROIs
@@ -24,6 +22,9 @@ Rules (``RULE_DEFAULTS`` hold for every bundle that does not set them):
     thalamus           "synthseg": a start / end ROI that is the template's thalamus becomes the
                        subject's SynthSeg thalamus (when pyAFQ's tissue comes from SynthSeg);
                        "template": keep it
+
+A cross_midline=False bundle is kept to its hemisphere strictly: the other side of world x = 0
+is excluded (images must be oriented so that the midline is x = 0).
 
 ``mpat_bd()`` is MPAT's default dictionary: pyAFQ's defaults (default + SLF + callosal) and
 the hippocampal cingulum and the fornix (MPAT only: its ends are SynthSeg labels, which
@@ -44,14 +45,10 @@ FORNIX_BOX_MNI = dict(x=(-3.0, 3.0), y=(-28.0, 15.0), z=(-5.0, 22.0))
 # thalamus and forward over it, as the fornix runs.
 FORNIX_BODY_MNI = dict(x=(-4.0, 4.0), y=(-25.0, -5.0), z=(8.0, 22.0))
 
-RULE_DEFAULTS = dict(midline_tol=0.0, exclude_mni_boxes=(), include_mni_boxes=(), start_synthseg=None,
+RULE_DEFAULTS = dict(exclude_mni_boxes=(), include_mni_boxes=(), start_synthseg=None,
                      end_synthseg=None, synthseg_tol_mm=None, thalamus="synthseg")
 
 MPAT_RULES = {
-    # next to the midline in the brainstem: a voxel-exact cut severs it (pyAFQ checks only 20
-    # points per streamline, so it forgives short dips across)
-    "Left Corticospinal": dict(midline_tol=10.0),
-    "Right Corticospinal": dict(midline_tol=10.0),
     # walkers otherwise reach the thalamus along the fornix on the midline; the real ATR runs
     # lateral to the ventricles
     "Left Anterior Thalamic": dict(exclude_mni_boxes=[FORNIX_BOX_MNI]),
@@ -98,7 +95,7 @@ def hcc_bd():
 def fornix_bd(resample_to=None):
     """The fornix, from the hippocampus (fimbria) along the body on the midline to the
     hypothalamus (columns, mammillary bodies): SynthSeg's hippocampus and hypothalamus as its
-    ends, its body (FORNIX_BODY_MNI) as a waypoint, each side kept to its own hemisphere but for 3 mm.
+    ends, its body (FORNIX_BODY_MNI) as a waypoint, each side kept to its own hemisphere.
     MPAT only.  pyAFQ's SynthSeg run has no hypothalamus, so MPAT reruns SynthSeg with its
     hypothalamus model for these ROIs when it is missing (<stem>_model-synthseg2hypo_dseg.nii.gz,
     reused afterwards; mpat.afq._synthseg_on_grid).  pyAFQ's tissue is not changed: there the
@@ -111,7 +108,7 @@ def fornix_bd(resample_to=None):
         out[f"{side} Fornix"] = dict(
             cross_midline=False,
             mpat=dict(start_synthseg=[f"{s}_HIPPOCAMPUS"], end_synthseg=[f"{s}_HYPOTHALAMUS"],
-                      include_mni_boxes=[FORNIX_BODY_MNI], midline_tol=3.0))
+                      include_mni_boxes=[FORNIX_BODY_MNI]))
     kw = {} if resample_to is None else dict(resample_to=resample_to)
     return abd.BundleDict(out, **kw)
 
@@ -147,7 +144,7 @@ def synthseg_cst_labels(side):
 def synthseg_cst_bd(resample_to=None):
     """The corticospinal tracts from SynthSeg endpoints only (no waypoints): each side's
     precentral, paracentral and postcentral cortex to the brainstem (synthseg_cst_labels), kept to its own
-    hemisphere as pyAFQ's CST is (MPAT_RULES' midline tolerance).  The labels are used as they
+    hemisphere as pyAFQ's CST is.  The labels are used as they
     are (synthseg_tol_mm 0), not grown by pyAFQ's 4 mm dist_to_atlas: they are the subject's
     own, with no registration error to allow for.  Named as pyAFQ's CSTs, so
     they replace them in a dictionary.  The cortical parcels come from rerunning SynthSeg with

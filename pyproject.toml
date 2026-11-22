@@ -19,7 +19,6 @@ dependencies = [
 [project.optional-dependencies]
 viewer = ["ipyniivue>=2.4"]
 gpu = ["warp-lang>=1.9"]
-gpu-numba = ["numba-cuda[cu13]>=0.30.2", "cuda-core>=1.0", "cuda-toolkit[nvjitlink]==13.*"]
 test = ["pytest>=8"]
 docs = [
     "sphinx>=7.3", "myst-parser>=3", "pydata-sphinx-theme>=0.15", "sphinx-design",

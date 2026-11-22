@@ -55,8 +55,7 @@ mpat dwi.nii.gz dwi.bval dwi.bvec T2w.nii.gz out/ --n-proc 12 --max-mem 16GB \
                        bundle_info=abd.baby_bd(), pve="babyseg", brain_mask_definition=BabyBrainMask())'
 ```
 
-Add `--live` to watch the bundles fill in on a web page while they are solved ({doc}`live`),
-and `--gpu` to run the solves on an NVIDIA GPU ({doc}`gpu`).
+Add `--live` to watch the bundles fill in on a web page while they are solved ({doc}`live`).
 All flags are listed in {doc}`cli`.
 
 ## Lower level: your own volumes

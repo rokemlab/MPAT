@@ -8,7 +8,6 @@ tractography + recognition, and draws the results.
     python examples/hbn_participant.py --n-proc 8 --max-mem 32GB
     python examples/hbn_participant.py --n-proc 8 --max-mem 32GB --data-dir /scratch/AFQ_data \\
         --bundles "Left Arcuate" "Left Corticospinal"
-    python examples/hbn_participant.py --n-proc 8 --gpu --gpu-backend numba-cuda      # on a GPU
 
 The data (about 400 MB) go to ``~/AFQ_data/HBN`` by default, as in pyAFQ's tutorial, and MPAT
 writes to ``.../derivatives/afq/sub-NDARAA948VFH/ses-HBNsiteRU/dwi/mpat/``.  ``--figures DIR``
@@ -181,9 +180,6 @@ def main(argv=None):
     p.add_argument("--data-dir", default=afd.afq_home, help="where HBN/ goes (default: ~/AFQ_data)")
     p.add_argument("--bundles", nargs="+", help="pyAFQ bundle names (default: all)")
     p.add_argument("--moments", action="store_true")
-    p.add_argument("--gpu", nargs="?", const="cuda", default=None, metavar="DEVICE",
-                   help="solve on a GPU (the first CUDA device, or DEVICE)")
-    p.add_argument("--gpu-backend", choices=("warp", "numba-cuda"), default="warp")
     p.add_argument("--figures", help="also save the documentation's figures in this folder")
     p.add_argument("--figures-only", action="store_true",
                    help="redraw the figures from an earlier run's outputs (needs --figures)")
@@ -200,7 +196,7 @@ def main(argv=None):
     out = op.join(myafq.kwargs["output_dir"], "mpat-moments" if a.moments else "mpat")
     if not a.figures_only:
         results = mpat.run(myafq, n_proc=a.n_proc, max_mem=a.max_mem, bundles=a.bundles,
-                           moments=a.moments, gpu=a.gpu, gpu_backend=a.gpu_backend)
+                           moments=a.moments)
         print(f"\n{len(results)} bundles in {(time.time() - t0) / 60:.1f} min -> {out}")
         for name, r in results.items():
             print(f"  {name:32s} {r.info['expected_bundle_streamlines']:9.1f} expected streamlines")

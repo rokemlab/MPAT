@@ -30,7 +30,7 @@ import numpy as np
 from scipy import ndimage as ndi
 from scipy.sparse import csgraph
 
-from .core import OFFS, _anchor, _graph, _resample, bundle_core, split_ends
+from .core import _anchor, _graph, _resample, bundle_core, split_ends
 from .fields import endpoint_patches
 from .geometry import OFFSETS
 

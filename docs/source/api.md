@@ -28,8 +28,6 @@
 .. autoclass:: mpat.solve.Launches
 
 .. autofunction:: mpat.solve.solve_series
-
-.. autofunction:: mpat.solve.bicgstab
 ```
 
 ## Geometry
@@ -67,18 +65,4 @@
    :no-members:
 
 .. autofunction:: mpat.moments.stabilize
-```
-
-## On a GPU
-
-```{eval-rst}
-.. autoclass:: mpat.gpu.DeviceOps
-
-.. autoclass:: mpat.gpu.WarpOps
-
-.. autoclass:: mpat.gpu.NumbaCudaOps
-
-.. autofunction:: mpat.gpu.available
-
-.. autofunction:: mpat.gpu.get_device
 ```

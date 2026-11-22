@@ -41,7 +41,6 @@ from pathlib import Path
 import numpy as np
 from numba import njit, prange
 
-from . import kernel as K
 from .geometry import Geometry, PMF_THRESHOLD, _sh_basis, vertex_visits
 
 log = logging.getLogger("mpat")

@@ -19,9 +19,8 @@ over the transition matrix.
 the other: the density then exists, as a lower bound that grows, from the first steps (the
 live view, mpat.live), and a solve can start from an earlier solution.
 
-The solves' arrays and the operations on them are an ``ops`` object: ``HostOps`` (numpy
-arrays, numba kernels; the default) or ``mpat.gpu.WarpOps`` (arrays on a GPU, NVIDIA Warp
-kernels).  The algorithm is the same for both.
+The solves' arrays and the operations on them are an ``ops`` object, ``HostOps`` (numpy
+arrays, numba kernels).
 """
 from __future__ import annotations
 
@@ -64,91 +63,12 @@ class Clock:
 
 
 STALL_WINDOW, STALL_RATIO = 200, 0.9   # stalled: remaining mass fell < 10% in 200 steps
-TAIL_MIN_STEPS = 30        # power steps before the Krylov tail may take over (walkers in transit)
-TAIL_SWITCH_AFTER = 500    # ... when power iteration would still need more steps than this
-TAIL_MAX_PRODUCTS = 3000   # for the whole Krylov tail, all rounds together
-TAIL_ROUNDS = 4            # Krylov rounds on what the previous one left, before power iteration
 FLOAT_BLOCKS_PER_COLUMN = 6    # float64 arrays per solution column at the peak
 OVERLENGTH_SURVIVAL = 0.5      # states where more walkers than this outlast the soft max length
 
 
-# ------------------------------------------------------------------ Krylov tail
-def _cdot(a, b):
-    return np.einsum("ij,ij->j", a, b)
-
-
-def bicgstab(apply, b, tol_abs, rows, max_mv=TAIL_MAX_PRODUCTS, restart=50):
-    """BiCGSTAB on every column of b in lockstep (one product per half-step shared by all
-    columns).  Converged columns are frozen; a column whose residual has not halved in
-    ``restart`` iterations restarts.  Returns (x, products, residual 1-norm over ``rows``)."""
-    k = b.shape[1]
-    x, r, rh = np.zeros_like(b), b.copy(), b.copy()
-    p, v, t = np.zeros_like(b), np.zeros_like(b), np.empty_like(b)
-    rho, alpha, omega = np.ones(k), np.ones(k), np.ones(k)
-    res = np.abs(r[rows]).sum(0)
-    done = res <= tol_abs
-    checkpoint = res.copy()
-    mv = 0
-
-    def div(a, d):
-        ok = (d != 0) & ~done
-        return np.where(ok, a / np.where(d != 0, d, 1.0), 0.0)
-
-    while not done.all() and mv < max_mv:
-        rho_new = _cdot(rh, r)
-        beta = div(rho_new, rho) * div(alpha, omega)
-        p *= beta
-        p -= v * (beta * omega)
-        p += r
-        apply(p, v)
-        alpha = div(rho_new, _cdot(rh, v))
-        r -= v * alpha
-        x += p * alpha
-        apply(r, t)
-        mv += 2
-        omega = div(_cdot(t, r), _cdot(t, t))
-        x += r * omega
-        r -= t * omega
-        rho = np.where(done, rho, rho_new)
-        res = np.abs(r[rows]).sum(0)
-        if not np.isfinite(res).all():
-            break
-        stuck = (alpha == 0) & (omega == 0) & ~done
-        if (mv // 2) % restart == 0:
-            stuck |= ~done & (res > 0.5 * checkpoint)
-            checkpoint = res.copy()
-        if stuck.any():
-            rh[:, stuck], p[:, stuck], v[:, stuck] = r[:, stuck], 0.0, 0.0
-            rho[stuck] = alpha[stuck] = omega[stuck] = 1.0
-        done |= res <= tol_abs
-    return x, mv, res
-
-
-def _bicgstab_cols(apply, b, tol_abs, rows, cols, ncols, max_mv=TAIL_MAX_PRODUCTS):
-    """bicgstab on columns ``cols`` of an operator ``apply`` that works on all ``ncols``
-    columns (the others zero; the operator acts column by column)."""
-    def sub(X, out):
-        full = np.zeros((X.shape[0], ncols))
-        full[:, cols] = X
-        res = np.empty_like(full)
-        apply(full, res)
-        out[...] = res[:, cols]
-
-    return bicgstab(sub, b, tol_abs, rows, max_mv=max_mv)
-
-
-def _crawling(hist, it, tol, window=10):
-    """The remaining mass decays geometrically and power iteration would still need more
-    than TAIL_SWITCH_AFTER steps to reach ``tol``."""
-    if it < TAIL_MIN_STEPS or it % window or len(hist) < 2 * window + 1 or hist[-1] <= 0:
-        return False
-    q1 = (hist[-1] / hist[-1 - window]) ** (1.0 / window)
-    q0 = (hist[-1 - window] / hist[-1 - 2 * window]) ** (1.0 / window)
-    return 0 < q1 < 1 and abs(q1 - q0) < 0.02 and np.log(tol / hist[-1]) / np.log(q1) > TAIL_SWITCH_AFTER
-
-
-def solve_series(mul, x0, mask, tol, max_iter, what, ncomp=1, verbose=False, accel=False, krylov=True,
-                 on_step=None, ops=None):
+def solve_series(mul, x0, mask, tol, max_iter, what, ncomp=1, verbose=False, accel=False, on_step=None,
+                 ops=None):
     """total = sum_t (M A)^t x0 per column (M = diag(mask)), A x = mul(x, out), by power
     iteration until the remaining mass (mass rows, relative to the largest column's start) is
     below ``tol``.  Stops early when it stalls (mass circulating in states that almost never
@@ -156,18 +76,12 @@ def solve_series(mul, x0, mask, tol, max_iter, what, ncomp=1, verbose=False, acc
     ``verbose``: log the time per step (matrix product / masking and summing) every 100 steps.
     ``accel``: False (default), True / "mr" (invariant-preserving Periodic Minimal Residual
     extrapolation), or "aitken" (scalar Aitken delta-squared extrapolation).
-    ``krylov``: when power iteration crawls or stalls, solve the rest of the series with BiCGSTAB.
     ``on_step``: optional callback ``on_step(it, res, total, term)`` invoked after each iteration
         (``term``: that iteration's term of the series, i.e. the current wavefront; numpy arrays).
-    ``ops``: the arrays' operations (default: numpy arrays on the host, ``HostOps``; arrays on a
-    GPU: ``mpat.gpu.DeviceOps``).  Extrapolation and the Krylov tail run on host arrays only.
+    ``ops``: the arrays' operations (default: ``HostOps``).
     Returns (total, info)."""
     ops = ops or HostOps(ncomp=ncomp)
-    host = isinstance(ops, HostOps)
     use_accel = (accel is not False and accel is not None)
-    if use_accel and not host:
-        log.warning("%s solve: extrapolation (accel) needs host arrays; plain power iteration on the GPU", what)
-        use_accel = False
     accel_kind = "mr" if accel is True else str(accel)
     burn_in, period, omega_max = 25, 8, 25.0
     t_start = time.perf_counter()
@@ -176,10 +90,9 @@ def solve_series(mul, x0, mask, tol, max_iter, what, ncomp=1, verbose=False, acc
     total = ops.copy(x0)
     term, nxt = x0, ops.empty_like(x0)
     mask = ops.contiguous(mask)
-    rows = slice(None, None, ncomp)
     scale = max(float(ops.col_mass(x0).max()), 1e-300)
     info = dict(iterations=0, residual=0.0, stalled=False, extrapolated_jumps=0)
-    hist, ref, tried = [], None, (not krylov) or use_accel or not host
+    ref = None
     for it in range(1, max_iter + 1):
         t0 = time.perf_counter()
         mul(term, nxt)
@@ -217,13 +130,11 @@ def solve_series(mul, x0, mask, tol, max_iter, what, ncomp=1, verbose=False, acc
         w_mul += t1 - t0
         w_acc += t2 - t1
         term, nxt = nxt, term
-        hist.append(res)
         info.update(iterations=it, residual=res)
-        if on_step is not None:
-            if host:
-                on_step(it, res, total, term)
-            else:
-                on_step(it, res, ops.to_host(total), ops.to_host(term))
+        if on_step is not None and getattr(on_step, "want", None) is not None and not on_step.want(it):
+            pass                       # a callback that only wants some iterations: nothing to copy
+        elif on_step is not None:
+            on_step(it, res, total, term)
         if it % 100 == 0:
             log.info("  %s step %d: remaining mass %.2e", what, it, res)
             if verbose:
@@ -239,73 +150,6 @@ def solve_series(mul, x0, mask, tol, max_iter, what, ncomp=1, verbose=False, acc
         if it % STALL_WINDOW == 0:
             stall = ref is not None and res > STALL_RATIO * ref
             ref = res
-        if not tried and (stall or _crawling(hist, it, tol)):
-            tried = True
-            tol_abs = tol * scale
-            act = np.flatnonzero(np.abs(term[rows]).sum(0) > tol_abs)
-            tmp = np.empty((term.shape[0], act.size))
-            msk = np.ascontiguousarray(mask[:, act])
-
-            def apply(X, out):
-                mul(np.ascontiguousarray(X), tmp)
-                tmp[...] *= msk
-                np.subtract(X, tmp, out=out)
-
-            log.info("  %s: switching to the Krylov tail at step %d (remaining mass %.1e, %s; %d columns)",
-                     what, it, res, "stalled" if stall else "decaying too slowly for power iteration", act.size)
-            t0_k = time.time()
-            pending = np.ascontiguousarray(term[:, act])
-            added = np.ones(act.size, bool)
-            live = np.ones(act.size, bool)
-            mv_all, rounds = 0, 0
-            resid = np.empty_like(pending)
-            for rounds in range(1, TAIL_ROUNDS + 1):
-                cols = np.flatnonzero(live)
-                budget = TAIL_MAX_PRODUCTS - mv_all
-                if not cols.size or budget < 2:
-                    break
-                every = cols.size == act.size
-                b = pending if every else np.ascontiguousarray(pending[:, cols])
-                r0 = np.abs(b[rows]).sum(0)
-                y, mv, _ = bicgstab(apply, b, tol_abs, rows, max_mv=budget) if every else \
-                    _bicgstab_cols(apply, b, tol_abs, rows, cols, act.size, max_mv=budget)
-                mv_all += mv
-                if every:
-                    apply(y, resid)
-                    np.subtract(b, resid, out=resid)
-                    r = resid
-                else:
-                    full = np.zeros_like(pending)
-                    full[:, cols] = y
-                    apply(full, resid)
-                    del full
-                    r = b - resid[:, cols]
-                r1 = np.abs(r[rows]).sum(0)
-                ok = np.isfinite(r1) & (r1 < 0.5 * r0)
-                acc = cols[ok]
-                total[:, act[acc]] += y[:, ok] - np.where(added[acc], 1.0, 0.0) * b[:, ok]
-                del y
-                pending[:, acc] = r[:, ok]
-                added[acc] = False
-                live[cols[~ok]] = False
-                live[acc[r1[ok] <= tol_abs]] = False
-                del r
-            del tmp, resid
-            add = ~added
-            total[:, act[add]] += pending[:, add]
-            term[:, act] = pending
-            left = np.abs(term[rows]).sum(0)
-            res = float(left.max()) / scale
-            info.update(tail_started_at=it, tail_products=int(mv_all), tail_rounds=rounds, residual=res,
-                        tail_seconds=round(time.time() - t0_k, 1))
-            log.info("  %s: Krylov tail from step %d, %d products in %d round(s), remaining %.1e (%.0fs)",
-                     what, it, mv_all, rounds, res, time.time() - t0_k)
-            if res < tol:
-                break
-            n_left = int((left[act] > tol_abs).sum())
-            log.info("  %s: %d of %d columns above tol after the Krylov tail continue with power "
-                     "iteration", what, n_left, act.size)
-            stall = False
         if stall:
             info["stalled"] = True
             log.warning("%s solve stalled at step %d: remaining mass %.2e circulates in states "
@@ -322,26 +166,23 @@ def solve_series(mul, x0, mask, tol, max_iter, what, ncomp=1, verbose=False, acc
 
 
 # ------------------------------------------------------------------ soft maximum length
-def overlength_states(chain, max_length_mm, zooms, ops=None):
+def overlength_states(chain, max_length_mm, zooms):
     """Direction states from which most walkers are still walking after ``max_length_mm``:
     the survival probability u_T = Q^T 1 (Q: one step among white-matter states) after
     T = max_length / smallest voxel side steps -- every step crosses into a neighbouring voxel,
     so a walk of T steps is at least that long.  Traps (white matter the turning limit makes
     hard to leave, e.g. a ring around a cavity) keep u_T near 1, ordinary states drain
     within a tract's length.  Bundle ROIs only add ways out, so this holds for every bundle.
-    ``ops``: where the products run (default: the host).
     Returns (kill: bool per state, survival per state, T)."""
-    ops = ops or HostOps(chain)
     T = int(np.ceil(max_length_mm / float(np.min(np.abs(zooms)))))
     nc = chain.ncomp
     u = np.zeros((chain.n_states * nc, 1))
     u[::nc] = 1.0                                        # the mass rows (moments: position-averaged)
-    u = ops.from_host(u)
-    out = ops.empty_like(u)
+    out = np.empty_like(u)
     for _ in range(T):
-        ops.mul("backward", u, out)
+        chain.mul_backward(u, out)
         u, out = out, u
-    surv = ops.to_host(u)[::nc, 0].copy()
+    surv = u[::nc, 0].copy()
     return surv >= OVERLENGTH_SURVIVAL, surv, T
 
 
@@ -442,6 +283,9 @@ class SolveStep:
     colsign: np.ndarray      # inclusion-exclusion sign of each column
     n_kinds: int             # end kinds of the first bundle (its columns 0 .. n_kinds - 1 avoid nothing)
     beta: np.ndarray = None  # the backward solution; forward phase only
+    names: list = None       # the group's bundles, in column order
+    offs: np.ndarray = None  # their first columns (and the end): bundle i is offs[i] .. offs[i + 1]
+    nks: list = None         # their end kinds (columns offs[i] .. offs[i] + nks[i] avoid nothing)
 
 
 def _endpoint_kinds(a_valid, a_start, a_end):
@@ -519,8 +363,7 @@ FLOAT_BLOCKS_INTERLEAVED = 7   # r, beta, pi0, S and a work array per solve, at 
 class HostOps:
     """The solves' arrays and their operations on the host: numpy arrays, numba kernels.
 
-    Every solve goes through one of these (``mpat.gpu.WarpOps`` is the same on a GPU):
-    allocating and copying arrays, a matrix product with the chain, one step of a series
+    Every solve goes through one of these: allocating and copying arrays, a matrix product with the chain, one step of a series
     (product, mask, sum, and what the step added per column), and the column groups
     (``group``: masks, absorption, the forward start, the bundles' maps)."""
 
@@ -542,12 +385,6 @@ class HostOps:
 
     def masked(self, a, mask):
         return a * mask
-
-    def from_host(self, a):
-        return np.asarray(a)
-
-    def to_host(self, a):
-        return a
 
     # the solves
     def mul(self, what, x, out):
@@ -575,25 +412,6 @@ class HostOps:
 
     def group(self, plans):
         return HostGroup(self.chain, plans, self.L)
-
-    def same_place(self, other):
-        """Whether arrays of ``other`` can be used here (an earlier solution, as a start)."""
-        return type(other) is type(self)
-
-
-def make_ops(chain, launches=None, backend=None, device=None, **kwargs):
-    """The solves' ops: ``backend`` "numba" (default; the host), or on a GPU "warp" or
-    "numba-cuda" (``mpat.gpu.DeviceOps`` on ``device``, default the first CUDA device;
-    ``kwargs`` go to it)."""
-    backend = (backend or "numba").lower()
-    if backend in ("numba", "host", "cpu"):
-        return HostOps(chain, launches)
-    if backend in ("warp", "gpu", "cuda", "numba-cuda"):
-        from .gpu import DeviceOps
-
-        return DeviceOps(chain, launches, device=device, backend="numba-cuda" if backend == "numba-cuda" else "warp",
-                         **kwargs)
-    raise ValueError(f"unknown backend {backend!r}: 'numba', 'warp' or 'numba-cuda'")
 
 
 class HostGroup:
@@ -686,7 +504,7 @@ def _solve(ops, x0, mask, tol, max_iter, what, verbose=False, accel=False, on_st
     if not hasattr(ops, "group"):
         ops = HostOps(ops)
     return solve_series(lambda x, out: ops.mul(what, x, out), x0, mask, tol, max_iter, what, ops.nc, verbose,
-                        accel=accel, krylov=False, on_step=on_step, ops=ops)
+                        accel=accel, on_step=on_step, ops=ops)
 
 
 def _bundle_results(chain, plans, L, group, S, beta, starts, tol, info_b, info_f, on_result, gclock,
@@ -768,13 +586,17 @@ def _solve_group(chain, plans, L, tol, max_iter, on_result, on_trapped=None, ver
     colsign_all = np.concatenate([p.signs[p.xcol] for p in plans])
     n_kinds = plans[0].nK
 
+    offs = np.cumsum([0] + [p.C for p in plans])
+    nks = [p.nK for p in plans]
+
     def step_hook(phase, beta=None):
         if on_step is None:
             return None
-        if beta is not None and not isinstance(ops, HostOps):
-            beta = ops.to_host(beta)
-        return lambda it, res, total, term: on_step(SolveStep(phase, it, res, total, term, colsign_all,
-                                                               n_kinds, beta))
+        def hook(it, res, total, term):
+            on_step(SolveStep(phase, it, res, total, term, colsign_all, n_kinds, beta, names, offs, nks))
+
+        hook.want = getattr(on_step, "want", None)    # only the iterations it wants
+        return hook
 
     if len(plans) > 1:
         log.info("solving %d bundles together (%d columns): %s", len(plans), sum(p.C for p in plans),
@@ -854,7 +676,7 @@ class Interleaved:
             self.group = g = ops.group(self.plans)
         self.offs, self.mask, self.r = g.offs, g.mask, g.r
         self._scale_b = max(float(ops.col_mass(self.r).max()), 1e-300)
-        warm = (start is not None and start.chain is chain and ops.same_place(start.ops)
+        warm = (start is not None and start.chain is chain
                 and tuple(start.beta.shape) == tuple(self.r.shape) and start.S is not None)
         if start is not None and not warm:
             log.info("the earlier solution has other columns; starting from zero")
@@ -1018,7 +840,7 @@ class Interleaved:
 def segment_bundles(chain, specs, launches, tol=1e-6, max_mem=8e9, max_iter=5000,
                     valid_classes=VALID_ENDS, on_result=None, on_trapped=None, verbose=False,
                     clock=None, keep_fields=False, accel=False, arc_length=False, zooms=None, on_step=None,
-                    on_progress=None, source_every=4, ops=None, backend=None, device=None):
+                    on_progress=None, source_every=4, ops=None):
     """Segment bundles, sharing solves.  ``specs``: dicts with ``name`` and optional
     ``include`` (list of masks), ``exclude``, ``start``, ``end`` (boolean volumes on the chain
     grid).  Bundles are packed in order into groups whose columns fit in ``max_mem`` bytes;
@@ -1029,9 +851,7 @@ def segment_bundles(chain, specs, launches, tol=1e-6, max_mem=8e9, max_iter=5000
     call this after every step, and once more when the group has converged, with the solve:
     ``solve.volume(i)`` is bundle ``solve.names[i]`` so far, ``solve.remaining`` the mass
     left.  The results are the same to the tolerance.  ``source_every``: see ``Interleaved``.
-    ``backend``: where the solves run, "numba" (default: the host) or "warp" (a GPU, on
-    ``device``; mpat.gpu), or ``ops``: the ops themselves (``make_ops``).  On a GPU, groups are
-    sized by the device's free memory.
+    ``ops``: the solves' ops (default: a new ``HostOps``).
     ``verbose``: timing inside the solves.  ``clock``: a Clock to add the time per stage to
     (default: a new one, reported at the end).
     ``keep_fields``: also keep each bundle's solution columns (occupancy, completion and
@@ -1058,12 +878,11 @@ def segment_bundles(chain, specs, launches, tol=1e-6, max_mem=8e9, max_iter=5000
     clock = clock or Clock()
     t_all = time.perf_counter()
     if ops is None:
-        ops = make_ops(chain, launches, backend, device)
+        ops = HostOps(chain, launches)
     else:
         ops.L = launches        # this call's launches (e.g. SIFT2's, which replace the seeds' own)
     cap = ops.max_columns(max_mem, live)
-    log.info("column groups of up to %d columns (%s)", cap, ops.budget_note(max_mem) if hasattr(ops, "budget_note")
-             else f"{max_mem / 1e9:.1f} GB budget")
+    log.info("column groups of up to %d columns (%.1f GB budget)", cap, max_mem / 1e9)
 
     def solve(group):
         if not live:

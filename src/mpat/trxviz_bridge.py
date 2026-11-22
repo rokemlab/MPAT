@@ -1401,7 +1401,6 @@ def cmd_solve_bundle(req_path: str) -> None:
         midline_mode = True
     elif midline_mode in ("false", "off", "none", ""):
         midline_mode = False
-    midline_tol_mm = float(req.get("midline_tol_mm", 0.0))
     bundle_name = str(req.get("bundle_name") or "Bundle")
     if midline_mode:
         from .afq import _is_left
@@ -1411,7 +1410,7 @@ def cmd_solve_bundle(req_path: str) -> None:
             is_left = midline_mode == "left"
         else:
             is_left = _is_left(bundle_name, {"include": include_masks, "start": start_mask, "end": end_mask}, xyz_x)
-        mid_exc = (xyz_x > midline_tol_mm) if is_left else (xyz_x < -midline_tol_mm)
+        mid_exc = (xyz_x > 0) if is_left else (xyz_x < 0)          # strict: the midline is world x = 0
         exclude_mask = mid_exc if exclude_mask is None else (exclude_mask | mid_exc)
 
     spec: Dict[str, Any] = {

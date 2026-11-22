@@ -11,9 +11,6 @@
 | `bundles` | `--bundles` | all in pyAFQ's bundle dictionary | pyAFQ names, e.g. `"Left Arcuate"`; output files drop the spaces (`bundle-LeftArcuate`) |
 | `cores` | – | `True` | also write each bundle's core |
 | `live` | `--live` | off | draw each bundle in 3-D in a browser while it is solved ({doc}`live`) |
-| `gpu` | `--gpu` | off | run the solves on an NVIDIA GPU (`True`, or a device such as `"cuda:1"`; {doc}`gpu`) |
-| `gpu_weights` | `--gpu-weights` | `float64` | `float32` nearly halves the chain on the GPU; densities then agree to about 1e-5 |
-| `gpu_backend` | `--gpu-backend` | `warp` | the GPU code's compiler: `warp` (NVIDIA Warp) or `numba-cuda` (`--gpu-backend numba`) |
 
 ## Choosing them
 
@@ -26,12 +23,6 @@ result.
 
 **`tol`.** A typical bundle loses about 10% of its walker mass per step, so $10^{-10}$ takes
 300–500 steps.
-
-**Solves that crawl** switch to a Krylov solver automatically; there is no setting for it.
-When nearly everything is walkable (all white matter, say), walkers circle for thousands of
-steps. Once power iteration would need 500 or more further steps, or stalls, the rest of the
-series is solved with BiCGSTAB. Each bundle's summary reports the step at which this happened
-and the number of products it took.
 
 **`double_odf`.** doubleODF weights each hop by how well the next voxel's fODF supports it
 (similar to iFOD2). singleODF follows the current voxel's fODF only, like pyAFQ's first-order

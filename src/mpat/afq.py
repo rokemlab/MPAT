@@ -138,10 +138,9 @@ def _subject_thalamus(name, k, roi, thalamus, x, tol):
     return thalamus[side].copy()
 
 
-def bundle_specs(afq, ref_img, transient, names=None, thalamus=None, no_midline=(), midline_tol=None,
-                 fornix=True):
+def bundle_specs(afq, ref_img, transient, names=None, thalamus=None, no_midline=(), fornix=True):
     """bundle_specs_iter as a list (every bundle's ROIs at once)."""
-    return list(bundle_specs_iter(afq, ref_img, transient, names, thalamus, no_midline, midline_tol, fornix))
+    return list(bundle_specs_iter(afq, ref_img, transient, names, thalamus, no_midline, fornix=fornix))
 
 
 def mni_box(box, bd, mapping, ref_img):
@@ -160,18 +159,17 @@ def mni_box(box, bd, mapping, ref_img):
     return _on_grid(nib.Nifti1Image(np.asarray(warped, np.float32), ref_img.affine), ref_img, order=0) > 0
 
 
-def bundle_specs_iter(afq, ref_img, transient, names=None, thalamus=None, no_midline=(), midline_tol=None,
-                      fornix=True, hypo_file=None, parc_file=None):
+def bundle_specs_iter(afq, ref_img, transient, names=None, thalamus=None, no_midline=(), fornix=True,
+                      hypo_file=None, parc_file=None, ends_only=False):
     """MPAT bundle specs from pyAFQ's bundle dictionary and MPAT's rules (mpat.bundles): include /
     exclude ROIs (sealed), start / end ROIs grown by pyAFQ's ``dist_to_atlas``, and the other
     hemisphere excluded for bundles that may not cross the midline.  Other pyAFQ criteria
-    (curvature, length, cleaning) are streamline-based and do not apply.  Yields one bundle at
+    (curvature, length, cleaning) are streamline-based and do not apply.  The midline is world
+    x = 0, cut strictly (images must be oriented so that it is: e.g. ACPC-aligned).  Yields one bundle at
     a time, each warped only when it is asked for, so a run holds the ROIs of the bundles it is
     solving and no others.
 
     no_midline  bundle names whose cross_midline=False is ignored (no other-hemisphere exclusion)
-    midline_tol overrides the midline_tol rule of the bundles that have one (the corticospinal
-                tracts); None: the rules' own
     fornix      False: drop the fornix box (mpat.bundles.FORNIX_BOX_MNI) from the exclusions
                 (the anterior thalamic radiations as pyAFQ defines them)
     parc_file   where SynthSeg with its cortical parcels and hypothalamus is kept (written on
@@ -179,6 +177,10 @@ def bundle_specs_iter(afq, ref_img, transient, names=None, thalamus=None, no_mid
                 hypothalamus and no hypo_file has it)
     hypo_file   where SynthSeg with the hypothalamus is kept, when a bundle's SynthSeg ROIs use
                 the hypothalamus (the fornix) and pyAFQ's SynthSeg lacks it (_synthseg_on_grid)
+    ends_only   drop the include ROIs (waypoints): start / end ROIs, exclusions and the hemisphere
+                define the bundle; an optic radiation's thalamic end is then cut to its lateral-
+                posterior-inferior eighth, the LGN's (lgn_end), since no waypoints keep out the
+                pulvinar's occipital fibres
     thalamus    {"left": mask, "right": mask} on ``ref_img``'s grid (SynthSeg's): a start / end
                 ROI that is the template's thalamus -- at least half of it within ``dist_to_atlas``
                 of a thalamus, or its centre inside one -- is replaced by the subject's thalamus
@@ -237,13 +239,61 @@ def bundle_specs_iter(afq, ref_img, transient, names=None, thalamus=None, no_mid
         if bd[name].get("cross_midline") is False and name in no_midline:
             log.info("%s: no midline exclusion (no_midline)", name)
         elif bd[name].get("cross_midline") is False:
-            t = r["midline_tol"] if midline_tol is None or not r["midline_tol"] else midline_tol
             left = _is_left(name, spec, x)
-            exc.append(x > t if left else x < -t)
-            log.info("%s: kept to the %s hemisphere (other side excluded past %g mm)", name,
-                     "left" if left else "right", t)
+            exc.append(x > 0 if left else x < 0)
+            log.info("%s: kept to the %s hemisphere (world x %s 0)", name, "left" if left else "right",
+                     "<=" if left else ">=")
         spec["exclude"] = np.any(exc, axis=0) if exc else None
+        if ends_only:
+            if spec["include"]:
+                log.info("%s: its %d include ROI(s) dropped (ends only)", name, len(spec["include"]))
+                spec["include"] = []
+            spec = lgn_end(spec, thalamus, ref_img.affine)
         yield spec
+
+
+OPTIC_RADIATION = re.compile(r"optic\s*radiation", re.IGNORECASE)
+
+
+def lgn_eighth(roi, affine):
+    """The lateral-posterior-inferior eighth of a thalamic end ROI, where the lateral geniculate
+    nucleus lies: its voxels lateral of, behind and below its centre (world RAS mm; lateral:
+    away from the midline, x = 0).  None if that leaves nothing."""
+    ijk = np.argwhere(roi)
+    if not len(ijk):
+        return None
+    xyz = nib.affines.apply_affine(affine, ijk)
+    c = xyz.mean(0)
+    lateral = xyz[:, 0] < c[0] if c[0] < 0 else xyz[:, 0] > c[0]
+    keep = lateral & (xyz[:, 1] < c[1]) & (xyz[:, 2] < c[2])
+    if not keep.any():
+        return None
+    out = np.zeros(roi.shape, bool)
+    out[tuple(ijk[keep].T)] = True
+    return out
+
+
+def lgn_end(spec, thalamus, affine):
+    """An optic radiation's spec with its thalamic end (the end ROI on the subject's thalamus,
+    else its start) cut to its lateral-posterior-inferior eighth (lgn_eighth).  Other bundles:
+    as they are."""
+    if not OPTIC_RADIATION.search(spec["name"]):
+        return spec
+    ends = [k for k in ("start", "end") if spec.get(k) is not None and np.asarray(spec[k]).any()]
+    if not ends:
+        return spec
+    k = "start" if "start" in ends else ends[0]
+    if thalamus is not None:
+        both = thalamus["left"] | thalamus["right"]
+        k = max(ends, key=lambda e: int((np.asarray(spec[e], bool) & both).sum()))
+    roi = np.asarray(spec[k], bool)
+    cut = lgn_eighth(roi, affine)
+    if cut is None:
+        log.warning("%s: no lateral-posterior-inferior eighth of its %s ROI; kept whole", spec["name"], k)
+        return spec
+    log.info("%s: its %s ROI cut to its lateral-posterior-inferior eighth (the LGN's): %d of %d voxels",
+             spec["name"], k, int(cut.sum()), int(roi.sum()))
+    return {**spec, k: cut}
 
 
 HYPOTHALAMUS = (102, 103)     # SynthSegLabels.LEFT_ / RIGHT_HYPOTHALAMUS
@@ -394,15 +444,15 @@ def _thalami_if_synthseg(afq, sh_img, synthseg_thalamus):
     return _subject_thalami(afq, sh_img) if use else None
 
 
-def roi_specs(afq, sh_img, transient, stem, bundles=None, thalamus=None, no_midline=(), midline_tol=None,
-              fornix=True):
+def roi_specs(afq, sh_img, transient, stem, bundles=None, thalamus=None, no_midline=(), fornix=True,
+              ends_only=False):
     """bundle_specs_iter, writing each bundle's ROI masks as it goes: start / end, the include
     ROIs (labelled 1, 2, ... in pyAFQ's order) and the exclude ROIs (without the other
     hemisphere, which cross_midline=False bundles exclude too)."""
     for spec in bundle_specs_iter(afq, sh_img, transient, bundles, thalamus=thalamus, no_midline=no_midline,
-                                  midline_tol=midline_tol, fornix=fornix,
+                                  fornix=fornix,
                                   hypo_file=f"{stem}_model-synthseg2hypo_dseg.nii.gz",
-                                  parc_file=parc_file_of(stem)):
+                                  parc_file=parc_file_of(stem), ends_only=ends_only):
         b = f"{stem}_bundle-{re.sub(r'[^A-Za-z0-9]', '', spec['name'])}"
         save = lambda m, desc: nib.save(nib.Nifti1Image(np.asarray(m, np.uint8), sh_img.affine),  # noqa: E731
                                         f"{b}_desc-{desc}_mask.nii.gz")
@@ -421,7 +471,7 @@ def roi_specs(afq, sh_img, transient, stem, bundles=None, thalamus=None, no_midl
 
 
 def write_rois(afq, bundles=None, moments=False, synthseg_thalamus=True, no_midline=(), page=True,
-               midline_tol=None, out_dir=None, fornix=True):
+               out_dir=None, fornix=True, ends_only=False):
     """Write the ROI masks of a finished run's bundles (start / end / include / exclude) without
     solving anything, and a viewer page showing them (bundles with no streamlines included).
     Returns the page's path (or None)."""
@@ -439,7 +489,8 @@ def write_rois(afq, bundles=None, moments=False, synthseg_thalamus=True, no_midl
         log.warning("no run outputs for %s: their ROIs are not written",
                     [n for n in names if n not in run_names])
     thal = _thalami_if_synthseg(afq, sh_img, synthseg_thalamus)
-    for spec in roi_specs(afq, sh_img, transient, stem, run_names, thal, no_midline, midline_tol, fornix):
+    for spec in roi_specs(afq, sh_img, transient, stem, run_names, thal, no_midline, fornix,
+                          ends_only=ends_only):
         log.info("%s: ROI masks written", spec["name"])
     if not page or not run_names:
         return None
@@ -514,6 +565,23 @@ def visualize(out, stem, bundles, fodf=None, t1=None, rois=False, colormap=None,
             log.info("%s: %s", what, job())
         except Exception as err:  # noqa: BLE001
             log.warning("%s not written: %s", what, err)
+
+
+def write_table(stem, rows):
+    """The run's table of bundles (one row each), rewritten after every bundle: a run stopped
+    part-way still has one for the bundles it finished."""
+    if not rows:
+        return
+    with open(f"{stem}_desc-mpat_table.tsv", "w", newline="") as fh:
+        w = csv.DictWriter(fh, fieldnames=list(rows[0]), delimiter="\t")
+        w.writeheader()
+        w.writerows(rows)
+
+
+def stopped(n):
+    """Log that a run was stopped (Ctrl-C) and what is still written."""
+    log.warning("stopped: writing the table, cores and figures of the %d bundle(s) done so far (Ctrl-C again to "
+                "skip them)", n)
 
 
 def mpat_dir(afq, moments=False, out_dir=None):
@@ -645,11 +713,10 @@ def _bytes(x):
 
 def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angle=35.0, double_odf=True,
         cores=True, viz=True, synthseg_thalamus=True, max_length=250.0, viz_rois=False,
-        no_midline=(), midline_tol=None, out_dir=None, verbose=False, fornix=True, flux=False,
+        no_midline=(), out_dir=None, verbose=False, fornix=True, flux=False,
         fixels=False, viz_colormap=None, ptt=False, step=1.0, stop_mass=None, fod_thresh=None,
         fod_power=None, curv_sigma=None, probe_radius=None, sift2=False, arbor=False,
-        arbor_branches=5, save_transitions=False, live=None, gpu=None, gpu_weights="float64",
-        gpu_backend="warp"):
+        arbor_branches=5, save_transitions=False, live=None, ends_only=False, movie=None):
     """Segment pyAFQ's bundles with MPAT.
 
     afq         ``ParticipantAFQ`` or ``GroupAFQ`` (every participant in turn)
@@ -672,9 +739,8 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
     viz_colormap  NiiVue colour map of the density on the per-bundle viewer pages (default
                 actc; e.g. "turbo", "hot"), the all-bundles page included ("bundle": one hue per bundle)
     no_midline  bundle names whose cross_midline=False is ignored (no other-hemisphere exclusion)
-    midline_tol mm past the midline the corticospinal tracts may go before the other hemisphere
-                is excluded (default: their rule, 10; 0: a strict cut); every other one-sided bundle
-                follows its own rule (mpat.bundles; default a strict cut at x = 0)
+                (the other hemisphere: world x past 0, strictly; images must be oriented so that the
+                midline is x = 0)
     max_length  soft maximum streamline length (mm; 0: none).  Before any bundle is solved,
                 direction states from which most walkers would still be walking after this
                 long -- traps where they circle, unable to turn out under the angle limit --
@@ -691,15 +757,12 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
                 ``mpat.live.LiveView``.  The backward and forward solves of each group are then
                 advanced together (mpat.solve.Interleaved), so a bundle is drawn from the first
                 steps and fills in; the results are the same to the tolerance
-    gpu         run the solves on a GPU (mpat.gpu): True for the first CUDA device, or a device
-                name ("cuda:1"; with Warp, "cpu" runs the GPU code on Warp's CPU device, for
-                testing).  The chain is still built on the host
-    gpu_backend "warp" (default; NVIDIA Warp, pip install warp-lang) or "numba-cuda"
-                (pip install "numba-cuda[cu13]"): the same kernels, two compilers
-    gpu_weights "float64" (default) or "float32": the transition probabilities on the GPU
-                (float32 nearly halves the chain there; densities then agree to about 1e-5)
     synthseg_thalamus  with pyAFQ's SynthSeg tissue (pve unset or "synthseg"), a template start / end
                 ROI that is the thalamus is replaced by SynthSeg's thalamus (see bundle_specs)
+    ends_only   drop the bundles' include ROIs (waypoints); the optic radiations then end in the
+                LGN's eighth of the thalamus (bundle_specs_iter)
+    movie       also write each bundle's solves as a video, <bundle>_desc-solves.mp4
+                (mpat.solvemovie): at most this many frames per solve (e.g. 40); not with live
     flux        also write each bundle's edge flux (mpat.fields): the expected streamline steps
                 from every voxel into each of its 26 neighbours, and the flux through each
                 voxel.  Not with moments.  The fields themselves are not kept here; use
@@ -734,12 +797,12 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
 
     if hasattr(afq, "pAFQ_list"):
         kw = dict(cores=cores, viz=viz, synthseg_thalamus=synthseg_thalamus, max_length=max_length,
-                  viz_rois=viz_rois, no_midline=no_midline, midline_tol=midline_tol,
+                  viz_rois=viz_rois, no_midline=no_midline,
                   verbose=verbose, fornix=fornix, flux=flux, fixels=fixels, viz_colormap=viz_colormap,
                   ptt=ptt, step=step, stop_mass=stop_mass, fod_thresh=fod_thresh, fod_power=fod_power,
                   curv_sigma=curv_sigma, probe_radius=probe_radius, sift2=sift2, arbor=arbor,
-                  arbor_branches=arbor_branches, save_transitions=save_transitions, live=live, gpu=gpu,
-                  gpu_weights=gpu_weights, gpu_backend=gpu_backend)
+                  arbor_branches=arbor_branches, save_transitions=save_transitions, live=live,
+                  ends_only=ends_only, movie=movie)
         return {f"sub-{s}_ses-{t}": run(p, n_proc, max_mem, bundles, moments, tol, angle, double_odf, **kw,
                                         out_dir=out_dir and str(Path(out_dir) / f"sub-{s}" / f"ses-{t}"))
                 for s, t, p in zip(afq.valid_sub_list, afq.valid_ses_list, afq.pAFQ_list)}
@@ -763,7 +826,8 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
     def specs():
         # each bundle's ROIs warped just before its group is solved, its ROI masks written then
         # (the solve keeps what it needs, so the ROIs can go)
-        yield from roi_specs(afq, sh_img, transient, stem, bundles, thal, no_midline, midline_tol, fornix)
+        yield from roi_specs(afq, sh_img, transient, stem, bundles, thal, no_midline, fornix,
+                             ends_only=ends_only)
 
     cfg = ChainConfig(
         angle=angle,
@@ -783,18 +847,11 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
                             cache=f"{stem}_desc-chain_cache.npz")
     with clock("pyAFQ inputs"):
         seeds = np.argwhere((_on_grid(nib.load(afq.export("wm_gm_interface")), sh_img, 0) > 0) & transient)
-    ops = None
-    if gpu:
-        from .gpu import DeviceOps
-
-        with clock("chain to the GPU"):
-            ops = DeviceOps(chain, device=None if gpu is True else gpu, weight_dtype=gpu_weights,
-                            backend=gpu_backend)
     t_ol = time.perf_counter()
     surv_state = None
     if max_length and max_length > 0:
         t1_ = time.time()
-        kill, surv, T = overlength_states(chain, max_length, sh_img.header.get_zooms()[:3], ops=ops)
+        kill, surv, T = overlength_states(chain, max_length, sh_img.header.get_zooms()[:3])
         surv_state = surv
         vox = surv.reshape(-1, chain.nb)
         nib.save(nib.Nifti1Image(chain.to_volume(vox.max(1)), sh_img.affine), f"{stem}_desc-overlength_map.nii.gz")
@@ -806,8 +863,6 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
     with clock("seed launches (prepare)"):
         launches = prepare_launches(chain, seeds)
     chain.release_pmfs()
-    if ops is not None:
-        ops.L = launches
     rows = []
 
     n_trapped = [0]
@@ -841,7 +896,7 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
                 s2_info["final_fit"]["pearson_r"],
             )
         whole = segment_bundles(chain, [dict(name="whole brain")], launches, tol=tol, max_mem=budget,
-                                on_trapped=trapped, ops=ops)["whole brain"]
+                                on_trapped=trapped)["whole brain"]
 
     if save_transitions:
         st_mode = "odx" if save_transitions is True else str(save_transitions).strip().lower()
@@ -862,6 +917,14 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
             if st_mode in ("nifti", "both"):
                 nii_paths = chain.save_nifti(stem, affine=sh_img.affine)
                 log.info("transitions NIfTI written to %s", nii_paths["transitions"])
+
+    movies = None
+    if movie:
+        if live:
+            raise ValueError("movie: not with live (the live view advances the two solves together)")
+        from .solvemovie import ChainMovies
+
+        movies = ChainMovies(chain, sh_img.affine, transient, frames=int(movie))
 
     def write(res):
         name = re.sub(r"[^A-Za-z0-9]", "", res.name)
@@ -900,6 +963,9 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
             res.fields = None
         for desc, (vol, suffix) in maps.items():
             nib.save(nib.Nifti1Image(vol, sh_img.affine), f"{b}_desc-{desc}_{suffix}.nii.gz")
+        if movies is not None:
+            with clock("videos"):
+                movies.finish(res.name, maps["density"][0], f"{b}_desc-solves.mp4")
         with open(f"{b}_desc-summary.json", "w") as fh:
             json.dump(dict(bundle=res.name, config=cfg.key(), result=res.info,
                            valid_ends=[ABSORB_CLASSES[c] for c in (1, 3)],
@@ -928,6 +994,7 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
         row.update(columns=i["n_columns"], backward_steps=i["backward"]["iterations"],
                    forward_steps=i["forward"]["iterations"], seconds=i["seconds"])
         rows.append(row)
+        write_table(stem, rows)
         log.info("%s: %.2f expected streamlines", res.name, i["expected_bundle_streamlines"])
 
     view = None
@@ -938,28 +1005,30 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
             chain.shape, sh_img.affine, port=8765 if live is True else int(live), title=Path(stem).name)
         log.info("live view: open %s in a browser (from another machine, first: "
                  "ssh -L %d:localhost:%d <this machine>)", view.url, view.port, view.port)
+    interrupted = False
     try:
         results = segment_bundles(chain, specs(), launches, tol=tol, max_mem=budget, on_result=write,
                                   on_trapped=trapped, verbose=verbose, clock=clock, keep_fields=flux,
-                                  on_progress=view.update if view is not None else None, ops=ops)
+                                  on_progress=view.update if view is not None else None,
+                                  on_step=movies)
+    except KeyboardInterrupt:           # keep what is done: its maps are written; the rest below
+        interrupted, results = True, {r["bundle"]: None for r in rows}
+        stopped(len(results))
+        if view is not None and view is not live:
+            view.close(0)
+            view = None
     except BaseException:
         if view is not None and view is not live:
             view.close(0)
         raise
-    finally:
-        if ops is not None:
-            ops.release()           # the GPU's memory, before the outputs and the next participant
     if view is not None:
         view.finish()
-    if fixels:
+    if fixels and not interrupted:
         with clock("fixels"):
             write_fixels(chain, sh, results, launches, f"{stem}_desc-mpat_fixels", sh_img.affine, tol, budget,
                          on_trapped=trapped, lobes=lobes, whole=whole)
-    with open(f"{stem}_desc-mpat_table.tsv", "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=list(rows[0]), delimiter="\t")
-        w.writeheader()
-        w.writerows(rows)
-    if cores:
+    write_table(stem, rows)
+    if cores and rows:
         from .core import write_cores
         with clock("cores"):
             write_cores(out)
@@ -968,7 +1037,7 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
         with clock("arbors"):
             write_arbors(out, max_end_branches=int(arbor_branches), max_lateral_offshoots=int(arbor_branches) + 1)
     t_viz = time.perf_counter()
-    if viz:
+    if viz and results:
         try:
             t1 = afq.export("t1_masked")
         except Exception:  # noqa: BLE001 -- the collage falls back to the tissue labels
@@ -980,4 +1049,6 @@ def run(afq, n_proc, max_mem="auto", bundles=None, moments=False, tol=1e-6, angl
     log.info("MPAT: %d bundles in %.0fs -> %s", len(results), time.time() - t0, out)
     if view is not None and view is not live:
         view.close()        # after a moment, so that open pages get the last frame
+    if interrupted:
+        raise KeyboardInterrupt
     return results

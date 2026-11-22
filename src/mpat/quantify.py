@@ -33,7 +33,7 @@ import scipy.sparse.linalg as spla
 from .core import split_ends
 from .fields import flux_orientation
 from .fixels import Lobes, fixel_streamlines, segment_lobes
-from .geometry import OFFSETS, class_chord_lengths
+from .geometry import OFFSETS
 
 
 @dataclass

@@ -28,7 +28,6 @@ from mpat import (
 from mpat.geometry import build_geometry
 import mpat.kernel as K
 from mpat.moments import MomentChain, _prep_m, _prep_m_tree
-from mpat.solve import solve_series
 
 
 def _sh(directions, kappa=20.0):

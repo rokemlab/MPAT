@@ -14,8 +14,7 @@ Extras:
 | extra | for |
 |---|---|
 | `viewer` | `mpat.view` in notebooks ([ipyniivue](https://github.com/niivue/ipyniivue)) |
-| `gpu` | the solves on an NVIDIA GPU, `--gpu` ([Warp](https://github.com/NVIDIA/warp); {doc}`gpu`) |
-| `gpu-numba` | the same with [numba-cuda](https://nvidia.github.io/numba-cuda/), `--gpu --gpu-backend numba` |
+| `gpu` | `--galerkin` (`mpat.galerkin`) on an NVIDIA GPU ([Warp](https://github.com/NVIDIA/warp)) |
 | `test` | the test suite (`pytest`) |
 | `docs` | building this documentation |
 

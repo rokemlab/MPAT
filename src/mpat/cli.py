@@ -22,49 +22,114 @@ def main(argv=None):
     p.add_argument("--max-length", type=float, default=250.0,
                    help="soft maximum streamline length, mm: states where walkers would mostly outlast "
                         "it (traps) end them, for every bundle (0: off)")
-    p.add_argument("--no-krylov", action="store_true", help=argparse.SUPPRESS)   # no-op (kept for old scripts)
     p.add_argument("--out-dir", help="write MPAT's outputs here (default: <output_dir>/mpat); "
                    "output_dir is then only read for pyAFQ's derivatives")
     p.add_argument("--verbose", action="store_true",
-                   help="log timing inside the solves (ms per power step)")
+                   help="log timing inside the solves (ms per power step; with --galerkin, progress every 5 s and "
+                        "each kernel's time in a step)")
     p.add_argument("--live", nargs="?", type=int, const=8765, default=None, metavar="PORT",
                    help="show the bundles in 3-D as they are solved, on a web page served from this "
                         "process (default port 8765, or the next free one): open the address it logs; "
                         "from another machine, forward the port first (ssh -L PORT:localhost:PORT host). "
                         "The backward and forward solves then advance together; same results")
     p.add_argument("--gpu", nargs="?", const="cuda", default=None, metavar="DEVICE",
-                   help="run the solves on a GPU: the first CUDA device, or DEVICE (e.g. cuda:1). The "
-                        "chain is still built on the CPU (--n-proc)")
-    p.add_argument("--gpu-backend", choices=("warp", "numba"), default="warp",
-                   help="the GPU code's compiler: NVIDIA Warp (pip install warp-lang) or numba-cuda "
-                        "(pip install \"numba-cuda[cu13]\"); the same kernels either way")
-    p.add_argument("--gpu-weights", choices=("float64", "float32"), default="float64",
-                   help="transition probabilities on the GPU: float32 nearly halves the chain there "
-                        "(densities then agree with float64 to about 1e-5)")
-    p.add_argument("--transport", action="store_true",
-                   help="solve the bundles as linear transport, not the Markov chain: walkers run straight in any "
-                        "of the sphere's directions and turn by the fODF (mpat.transport); on a GPU with NVIDIA "
-                        "Warp (--gpu picks the device); outputs in <output_dir>/mpat-transport (or --out-dir); "
-                        "--tol, --angle (largest turn) and --colormap apply; with --viz-only / --rois-only, "
-                        "the figures / ROIs of a transport run")
-    p.add_argument("--transport-mfp", type=float, default=2.0,
-                   help="--transport: mean straight run between turns, mm (default 2)")
-    p.add_argument("--transport-upsample", type=float, default=None, metavar="MM",
-                   help="--transport: solve on isotropic voxels of MM mm (e.g. 1.0) instead of the fODF's grid: "
-                        "less sideways blur, more memory and time (outputs on that grid)")
-    p.add_argument("--transport-max-iter", type=int, default=5000,
-                   help="--transport: sweeps per solve at most (one turn each; default 5000)")
-    p.add_argument("--transport-sphere", default="symmetric362",
-                   help="--transport: the walkers' directions, a DIPY sphere (default symmetric362; also "
+                   help="--galerkin: the CUDA device (default the first; e.g. cuda:1). MPAT's chain "
+                        "solves run on the CPU")
+    p.add_argument("--galerkin", action="store_true",
+                   help="solve the bundles with fixed-step walkers (probabilistic tracking's: a step, then a new "
+                        "direction from the fODF within --angle), all at once and deterministically: quadratic "
+                        "densities in bins, stepped exactly (Lagrange-Galerkin; mpat.galerkin); on a GPU with "
+                        "NVIDIA Warp (--gpu DEVICE picks one); outputs in <output_dir>/mpat-galerkin (or "
+                        "--out-dir); --tol (walkers left, of those launched; 1e-4 is plenty), --angle and "
+                        "--colormap apply; with --viz-only / --rois-only, the figures / ROIs of a galerkin run")
+    p.add_argument("--galerkin-bins", type=int, default=1, metavar="K",
+                   help="--galerkin: K x K x K bins per voxel (1, 3, 5; default 1): finer keeps a beam's position "
+                        "to 1/K voxel, at K^3 the memory and work; K > 1 solves each bundle in whole voxels first, "
+                        "then in the bins only where that density reaches --galerkin-floor of its peak")
+    p.add_argument("--galerkin-step", default="0.5", metavar="MM|Xvox",
+                   help="--galerkin: step length in mm (default 0.5, as pyAFQ's step_size), or with 'vox' a "
+                        "fraction of the smallest voxel side (e.g. 0.5vox, the step before mm); the log gives both; "
+                        "outside 0.15-1 voxel it warns")
+    p.add_argument("--galerkin-sphere", default="symmetric362",
+                   help="--galerkin: the walkers' directions, a DIPY sphere (default symmetric362; also "
                         "repulsion200, symmetric642, repulsion724)")
+    p.add_argument("--galerkin-max-steps", type=int, default=5000,
+                   help="--galerkin: steps per solve at most (default 5000)")
+    p.add_argument("--galerkin-floor", type=float, default=1e-3, metavar="FRAC",
+                   help="--galerkin-bins > 1: solve in bins where the whole-voxel density reaches FRAC of its "
+                        "peak (default 1e-3), grown by --galerkin-dilate voxels; walkers leaving it are lost")
+    p.add_argument("--galerkin-dilate", type=int, default=2, metavar="VOXELS",
+                   help="--galerkin-bins > 1: voxels the region of the fine solve is grown by (default 2)")
+    p.add_argument("--galerkin-interp", nargs="?", const="all", default="all", choices=("all", "wm", "off"),
+                   help="--galerkin-bins > 1: each bin's fODF, interpolated trilinearly between voxel centers: all "
+                        "(default): from every voxel, grey matter too, as DIPY's trackers; wm: from the white "
+                        "matter's voxels; off: every bin of a voxel has the voxel's fODF.  One bin per voxel: its "
+                        "fODF either way")
+    p.add_argument("--galerkin-points", type=int, default=0, metavar="N",
+                   help="--galerkin: each bin's walkers turn by the fODF interpolated at N^3 Gauss points of the bin "
+                        "(as DIPY's tracker, where each walker is) rather than one fODF per bin; N >= 3 (0: off).  "
+                        "Fine fODF detail without finer bins; the fODF at the points is computed in the turns "
+                        "(about the memory of no points), for spheres of up to 1024 directions")
+    p.add_argument("--galerkin-seed-mask", default=None, metavar="NIFTI",
+                   help="--galerkin: bundles from streamlines seeded in this mask (on the fODF's grid) as pyAFQ's "
+                        "GPU tracker seeds them -- random seeds, one streamline per fODF peak at each, its halves "
+                        "within the cone of the peak and of its reverse -- not from launches at the white "
+                        "matter's edge.  To match pyAFQ's maps (pass the seed mask it wrote); one forward solve more, "
+                        "and per end kind a backward and a forward")
+    p.add_argument("--galerkin-seed-count", type=int, default=1_000_000, metavar="N",
+                   help="--galerkin-seed-mask: seeds (default 1000000; pyAFQ's n_seeds with random_seeds, as DIPY's "
+                        "random_seeds_from_mask).  The solves cost the same for any N: more seeds, less sampling "
+                        "noise; the maps are for N seeds")
+    p.add_argument("--galerkin-seed-threshold", type=float, default=0.0, metavar="T",
+                   help="--galerkin-seed-mask: seed where the mask exceeds T (default 0)")
+    p.add_argument("--galerkin-seed-rng", type=int, default=0, metavar="SEED",
+                   help="--galerkin-seed-mask: the random generator's seed for the seeds (default 0)")
+    p.add_argument("--galerkin-stop", default="interp", choices=("interp", "voxel"),
+                   help="--galerkin: where walkers stop.  interp (default): as pyAFQ's GPU tracker, a walker stops "
+                        "where the WM PVE, trilinear at its landing point, is <= --galerkin-stop-threshold, and "
+                        "ends in that voxel whatever its tissue; the start / end ROIs decide.  Needs "
+                        "--galerkin-points.  voxel: walkers move in the tissue labels' white-matter voxels and end "
+                        "stepping into grey matter or the edge (CSF: lost)")
+    p.add_argument("--galerkin-stop-grid", default="fodf", choices=("fodf", "native"),
+                   help="--galerkin-stop interp: interpolate the WM PVE on the fODF's grid (default; resampled "
+                        "first, as pyAFQ's tracker) or on its own grid (native: the T1's resolution when pyAFQ's "
+                        "PVE is there)")
+    p.add_argument("--galerkin-until", default="ends", choices=("walkers", "ends"),
+                   help="--galerkin-seed-mask: when the forwards weighted by each half's partner stop (their "
+                        "backward is solved first).  ends (default): when their expected arrivals still to come "
+                        "(the walkers times their importance) are below --tol x those expected; walkers: when the "
+                        "walkers left are below --tol x those launched, as every other solve")
+    p.add_argument("--galerkin-prune", type=float, default=1e-9, metavar="FRAC",
+                   help="--galerkin-seed-mask: drop a bin's walkers in the forwards weighted by the partner when "
+                        "their expected arrivals are below FRAC x the solve's expected, and a bin's importance in "
+                        "the backwards when it times the all-halves forward's visits there is below FRAC x that end "
+                        "kind's arrivals (default 1e-9; 0: never).  What is dropped is tallied and logged: a bound "
+                        "on the arrivals (streamlines) lost")
+    p.add_argument("--galerkin-soft-max-len", type=float, default=0.0, metavar="MM",
+                   help="--galerkin: a soft maximum streamline length (default 0: none): each bundle's walkers move "
+                        "only within MM of both its start and its end ROI, where every streamline no longer than MM "
+                        "lies (longer paths within still count).  A bundle without start or end voxels is an error")
+    p.add_argument("--galerkin-stop-threshold", type=float, default=0.4, metavar="PVE",
+                   help="--galerkin-stop interp: stop where the WM PVE is at most this (default 0.4, pyAFQ's)")
+    p.add_argument("--galerkin-log-every", type=float, default=None, metavar="SECONDS",
+                   help="--galerkin: seconds between a solve's progress lines (step, walkers left, time per step, "
+                        "time to go; default 30, or 5 with --verbose)")
+    p.add_argument("--movie", "--galerkin-movie", dest="movie", nargs="?", type=int, const=40, default=None,
+                   metavar="FRAMES",
+                   help="also write each bundle's solves as a video (<bundle>_desc-solves.mp4): the walkers "
+                        "spreading from the ends (forward), the chance of reaching an end spreading back "
+                        "(backward), then the bundle; at most FRAMES frames per solve (default 40).  The chain "
+                        "(not with --live) and --galerkin")
+    p.add_argument("--ends-only", "--galerkin-ends-only", dest="ends_only", action="store_true",
+                   help="drop the bundles' include ROIs (waypoints): start / end ROIs, exclusions and the "
+                        "hemisphere still apply (with --galerkin: one forward + backward pair per "
+                        "end kind instead of one per end kind and subset of include ROIs); the optic radiations' "
+                        "thalamic end is then cut to its lateral-posterior-inferior eighth (the LGN's).  For "
+                        "every solver, and for --rois-only")
     p.add_argument("--mni-thalamus", action="store_true",
                    help="keep the template's thalamic start / end ROIs (default: SynthSeg's thalami)")
     p.add_argument("--no-viz", action="store_true",
                    help="skip the collage and viewer pages (written by default)")
-    p.add_argument("--midline-tol", type=float, default=None,
-                   help="mm past the midline the corticospinal tracts may go before the other hemisphere "
-                        "is excluded (default: their rule, 10; 0: strict cut at x = 0); other one-sided "
-                        "bundles follow their rules in mpat.bundles (default: cut at x = 0)")
     p.add_argument("--no-midline", nargs="+", default=(), metavar="BUNDLE",
                    help="ignore cross_midline=False for these bundles (no other-hemisphere exclusion)")
     p.add_argument("--no-fornix-exclude", action="store_true",
@@ -118,6 +183,20 @@ def main(argv=None):
                         "AFQ.definitions image / mapping classes in scope, e.g. "
                         "'dict(bundle_info=abd.baby_bd(), brain_mask_definition=BabyBrainMask())'")
     a = p.parse_args(argv)
+    if a.galerkin:
+        from .galerkin import parse_step
+
+        try:
+            parse_step(a.galerkin_step)
+        except ValueError as e:
+            p.error(f"--galerkin-step: {e}")
+        if a.galerkin_bins < 1:
+            p.error("--galerkin-bins must be a positive integer")
+        if a.galerkin_seed_count < 1:
+            p.error("--galerkin-seed-count must be positive")
+        if a.galerkin_stop == "interp" and not a.galerkin_points:
+            p.error("--galerkin-stop interp (the default) needs --galerkin-points N (N >= 3); or pass "
+                    "--galerkin-stop voxel")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     from AFQ.api.participant import ParticipantAFQ
 
@@ -137,18 +216,20 @@ def main(argv=None):
     else:
         kwargs["tracking_params"] = {"odf_model": "CSD"}
 
-    if a.transport and not (a.rois_only or a.viz_only):    # linear transport on a GPU, not the chain
-        from .transport import run_cli
+    if a.gpu and not a.galerkin:
+        p.error("--gpu picks --galerkin's device; MPAT's chain solves run on the CPU")
+    if a.galerkin and not (a.rois_only or a.viz_only):     # fixed-step walkers on a GPU, not the chain
+        from .galerkin import run_cli as galerkin_cli
 
-        run_cli(ParticipantAFQ(a.dwi, a.bval, a.bvec, a.t1, a.output_dir, **kwargs), a)
+        galerkin_cli(ParticipantAFQ(a.dwi, a.bval, a.bvec, a.t1, a.output_dir, **kwargs), a)
         return
-    if a.transport and not a.out_dir:          # --rois-only / --viz-only of a transport run
-        a.out_dir = os.path.join(a.output_dir, "mpat-transport")
+    if a.galerkin and not a.out_dir:           # --rois-only / --viz-only of a galerkin run
+        a.out_dir = os.path.join(a.output_dir, "mpat-galerkin")
     afq = ParticipantAFQ(a.dwi, a.bval, a.bvec, a.t1, a.output_dir, **kwargs)
     if a.rois_only:
         page = write_rois(afq, a.bundles, a.moments, synthseg_thalamus=not a.mni_thalamus, no_midline=a.no_midline,
-                          midline_tol=a.midline_tol, out_dir=a.out_dir,
-                          fornix=not a.no_fornix_exclude)
+                          out_dir=a.out_dir,
+                          fornix=not a.no_fornix_exclude, ends_only=a.ends_only)
         logging.getLogger("mpat").info("ROI page: %s", page)
         return
     if a.viz_only:
@@ -160,14 +241,14 @@ def main(argv=None):
     run(afq, a.n_proc, a.max_mem, a.bundles, a.moments, a.tol, a.angle, not a.single_odf, viz=not a.no_viz,
         synthseg_thalamus=not a.mni_thalamus,
         max_length=a.max_length, viz_rois=a.viz_rois, no_midline=a.no_midline,
-        midline_tol=a.midline_tol, out_dir=a.out_dir, verbose=a.verbose,
+        out_dir=a.out_dir, verbose=a.verbose,
         fornix=not a.no_fornix_exclude, flux=a.flux, fixels=a.fixels, viz_colormap=a.colormap,
         ptt=a.ptt, step=a.step, stop_mass=a.stop_mass, fod_thresh=a.fod_thresh,
         fod_power=a.fod_power, curv_sigma=a.curv_sigma, probe_radius=a.probe_radius,
         sift2=a.sift2, arbor=a.arbor, arbor_branches=a.arbor_branches,
         save_transitions=a.save_transitions or False,
-        live=a.live, gpu=a.gpu, gpu_weights=a.gpu_weights,
-        gpu_backend={"numba": "numba-cuda"}.get(a.gpu_backend, a.gpu_backend))
+        live=a.live, ends_only=a.ends_only,
+        movie=a.movie)
     if a.pyafq:   # pyAFQ's recognition: MPAT's rules removed, MPAT-only bundles (fornix) dropped
         from .bundles import pyafq_bd
 

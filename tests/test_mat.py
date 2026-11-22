@@ -1,5 +1,5 @@
-"""MAT: geometry, chain, bundle solves (against walkers sampled from the same chain), the
-Krylov tail, grouping, cores, the viewer, and an offline end-to-end run through pyAFQ."""
+"""MAT: geometry, chain, bundle solves (against walkers sampled from the same chain),
+grouping, cores, the viewer, and an offline end-to-end run through pyAFQ."""
 import nibabel as nib
 import numpy as np
 import pytest
@@ -207,30 +207,7 @@ def test_grouped_equals_separate_and_moments(crossing):
     assert 0.5 < e < 2
 
 
-# ------------------------------------------------------------------ Krylov tail
-def _sticky_chain(n=60, loops=((20, 0.9995), (40, 0.999))):
-    """Transport down a line with near-closed 2-cycles hanging off it (A[to, from])."""
-    N = n + 2 * len(loops)
-    A = np.zeros((N, N))
-    for j in range(n - 1):
-        A[j + 1, j] = 0.97
-    for k, (at, p) in enumerate(loops):
-        a, b = n + 2 * k, n + 2 * k + 1
-        A[at + 1, at], A[a, at], A[b, a], A[a, b], A[at + 1, b] = 0.5, 0.47, p, p, 1 - p - 1e-5
-    return A
-
-
-def test_krylov_tail_where_power_crawls():
-    A = _sticky_chain()
-    x0 = np.zeros((A.shape[0], 2))
-    x0[0, 0], x0[10, 1] = 1.0, 2.0
-    exact = np.linalg.solve(np.eye(len(A)) - A, x0)
-    tot, info = solve_series(lambda x, o: np.copyto(o, A @ x), x0.copy(), np.ones_like(x0), 1e-10,
-                             100000, "test")
-    assert info["tail_started_at"] < 300 and info["tail_products"] < 1500 and not info["stalled"]
-    assert np.abs(tot - exact).max() < 1e-8 * exact.max()
-
-
+# ------------------------------------------------------------------ power iteration
 def test_closed_loop_stalls_cleanly():
     A = np.array([[0.0, 0.0, 0.0], [0.01, 0.0, 1.0], [0.0, 1.0, 0.0]])
     tot, info = solve_series(lambda x, o: np.copyto(o, A @ x), np.array([[1.0], [0.0], [0.0]]),
@@ -238,14 +215,13 @@ def test_closed_loop_stalls_cleanly():
     assert info["stalled"] and np.isfinite(tot).all() and tot.max() < 1e3
 
 
-def test_fast_decay_never_switches():
+def test_fast_decay_converges():
     rng = np.random.default_rng(3)
     A = rng.random((40, 40))
     A *= 0.9 / A.sum(0)
     x0 = rng.random((40, 2))
     tot, info = solve_series(lambda x, o: np.copyto(o, A @ x), x0.copy(), np.ones_like(x0), 1e-12,
                              5000, "test")
-    assert "tail_started_at" not in info
     assert np.abs(tot - np.linalg.solve(np.eye(40) - A, x0)).max() < 1e-9
 
 
